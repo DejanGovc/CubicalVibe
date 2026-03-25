@@ -1,8 +1,13 @@
 # CubicalVibe
 
-Enumeration of closed cubical surfaces in the `n`-cube, with main focus on the `6`-cube. Vibe-coded in Python/Rust/SQLite3 using OpenAI Codex, hence the name. The project is mostly functional, but should currently be considered as **experimental and under construction**.
+Enumeration of closed cubical surfaces in the `n`-cube, with main focus on the `6`-cube. Vibe-coded in Python, Rust and SQLite3 using OpenAI Codex, hence the name. The project is mostly functional, but should currently be considered as **experimental and under construction**.
 
-Compile by running "./build_rust_so.sh" and then run using "python3 cubical.py".
+To compile and run the software, use:
+
+```
+./build_rust_so.sh
+python3 cubical.py
+```
 
 The following is an AI-generated summary of the project.
 
@@ -127,4 +132,4 @@ RUN_PROFILE_LOG=0 python3 cubical.py
 
 ## License
 
-No license has been chosen yet. See the repository license file once added.
+This project is licensed under the terms of the MIT License. See [LICENSE](LICENSE) for details.
