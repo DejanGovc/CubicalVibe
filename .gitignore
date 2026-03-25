@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Rust
+rust_code/target/
+
+# Native extension artifacts
+*.so
+*.dylib
+*.dll
+
+# SQLite databases and journals
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Generated text outputs
+*_result.txt
+cplxs*.txt
+
+# Local precompute caches
+precompute_cache_n*_v*.pkl
+
+# Local profiling / archival data
+run_profile.log
+old_logs/
+other/
+
+# Alternate local Rust build cache
+rust_code/.cargo_target/
+
+# Local scratch
+.tmp/
+
+# Crash dumps
+core
+core.*
