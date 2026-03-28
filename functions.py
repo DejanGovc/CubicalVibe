@@ -2,8 +2,10 @@ from functools import lru_cache
 from itertools import product
 from itertools import groupby
 from itertools import permutations
+from itertools import combinations
 import os
 import pickle
+import time
 
 import rust_code
 
@@ -15,7 +17,7 @@ n1 = None
 n2 = None
 chunksize = None
 num_bytes = None
-PRECOMPUTE_CACHE_VERSION = 1
+PRECOMPUTE_CACHE_VERSION = 3
 
 def initialize_globals(N,CHUNKSIZE):
     global n, n2, n1, n0, chunksize, num_bytes
@@ -177,14 +179,21 @@ def cycleq(tup):
 def cycles3(n,i):
     v = cubes(n,0)[i]
     lst = [s for s in cubes(n,2) if v in bbdry(s)]
-    cycs = tuple((a,b,c) for a in lst for b in lst for c in lst if a<b and b<c and cycleq((a,b,c)))
+    cycs = tuple(cyc for cyc in combinations(lst,3) if cycleq(cyc))
     return tuple(zeroone(cyc,cubes(n,2)) for cyc in cycs)
 
 @lru_cache(maxsize=None)
 def cycles4(n,i):
     v = cubes(n,0)[i]
     lst = [s for s in cubes(n,2) if v in bbdry(s)]
-    cycs = tuple((a,b,c,d) for a in lst for b in lst for c in lst for d in lst if a<b and b<c and c<d and cycleq((a,b,c,d)))
+    cycs = tuple(cyc for cyc in combinations(lst,4) if cycleq(cyc))
+    return tuple(zeroone(cyc,cubes(n,2)) for cyc in cycs)
+
+@lru_cache(maxsize=None)
+def cycles5(n,i):
+    v = cubes(n,0)[i]
+    lst = [s for s in cubes(n,2) if v in bbdry(s)]
+    cycs = tuple(cyc for cyc in combinations(lst,5) if cycleq(cyc))
     return tuple(zeroone(cyc,cubes(n,2)) for cyc in cycs)
 
 def initialize_rust_globals(): ### PRECOMPUTE VALUES AND PASS THEM TO RUST.
@@ -196,6 +205,12 @@ def initialize_rust_globals(): ### PRECOMPUTE VALUES AND PASS THEM TO RUST.
         cache_dir = os.environ.get("PRECOMPUTE_CACHE_DIR", ".")
         return os.path.join(cache_dir, f"precompute_cache_n{n}_v{PRECOMPUTE_CACHE_VERSION}.pkl")
 
+    def timed_build(name, builder):
+        t0 = time.time()
+        value = builder()
+        print(f"Precompute {name}: {time.time()-t0:.2f}s")
+        return value
+
     def build_payload():
         return {
             "version": PRECOMPUTE_CACHE_VERSION,
@@ -203,16 +218,15 @@ def initialize_rust_globals(): ### PRECOMPUTE VALUES AND PASS THEM TO RUST.
             "n2": n2,
             "n1": n1,
             "n0": n0,
-            "boundaries": [split_integer(i) for i in boundaries(n)],
-            "bboundaries": [split_integer(fake_octal(bboundaries(n)[i])) for i in range(n2)], # ASSUMING n <= 7
-            "edgeboundaries": [split_integer(fake_octal(edgeboundaries(n)[i])) for i in range(n1)], # ASSUMING n <= 7
-            "nnbhd": [list(nnbhd(i)) for i in range(n0)],
-            "permlist": [[list(pi) for pi in permlist(p)] for p in product(range(8),repeat=n)], # ASSUMING n <= 7
-            "cubes": [list(c) for c in cubes(n,0)],
-            "faceperm": {(c,p):faceperm((c,p)) for c in cubes(n,0) for p in permutations(range(n))},
-            "edgesquares": [split_integer(edgesquares(i)) for i in range(n1)],
-            "cycles3": [[split_integer(j) for j in cycles3(n,i)] for i in range(n0)],
-            "cycles4": [[split_integer(j) for j in cycles4(n,i)] for i in range(n0)],
+            "boundaries": timed_build("boundaries", lambda: [split_integer(i) for i in boundaries(n)]),
+            "bboundaries": timed_build("bboundaries", lambda: [split_integer(fake_octal(bboundaries(n)[i])) for i in range(n2)]), # ASSUMING n <= 7
+            "edgeboundaries": timed_build("edgeboundaries", lambda: [split_integer(fake_octal(edgeboundaries(n)[i])) for i in range(n1)]), # ASSUMING n <= 7
+            "nnbhd": timed_build("nnbhd", lambda: [list(nnbhd(i)) for i in range(n0)]),
+            "cubes": timed_build("cubes", lambda: [list(c) for c in cubes(n,0)]),
+            "edgesquares": timed_build("edgesquares", lambda: [split_integer(edgesquares(i)) for i in range(n1)]),
+            "cycles3": timed_build("cycles3", lambda: [[split_integer(j) for j in cycles3(n,i)] for i in range(n0)]),
+            "cycles4": timed_build("cycles4", lambda: [[split_integer(j) for j in cycles4(n,i)] for i in range(n0)]),
+            "cycles5": timed_build("cycles5", lambda: [[split_integer(j) for j in cycles5(n,i)] for i in range(n0)] if n >= 7 else [[] for _ in range(n0)]),
         }
 
     payload = None
@@ -258,12 +272,11 @@ def initialize_rust_globals(): ### PRECOMPUTE VALUES AND PASS THEM TO RUST.
         payload["bboundaries"],
         payload["edgeboundaries"],
         payload["nnbhd"],
-        payload["permlist"],
         payload["cubes"],
-        payload["faceperm"],
         payload["edgesquares"],
         payload["cycles3"],
-        payload["cycles4"]
+        payload["cycles4"],
+        payload["cycles5"]
     )
 
 def extendonce(ncplx):

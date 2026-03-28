@@ -1,9 +1,9 @@
 use pyo3::{PyResult,Python,prelude::*};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use rustc_hash::FxHasher;
 use lazy_static::lazy_static;
-use std::sync::{Mutex,Arc,OnceLock};
+use std::sync::{Mutex,Arc,OnceLock,RwLock};
 use std::hash::{Hash, Hasher};
 use pyo3::exceptions::PyRuntimeError;
 use rayon::prelude::*;
@@ -14,7 +14,7 @@ use rusqlite::Error as RusqliteError;
 
 use std::process;
 use ctrlc;
-use std::fs::remove_file;
+use std::fs::{remove_file, rename};
 use std::path::Path;
 use std::time::Instant;
 use std::fs::OpenOptions;
@@ -51,6 +51,8 @@ static BLOB_ENCODE_CACHE: OnceLock<bool> = OnceLock::new();
 static STAGE_GOOD_INSERTS: OnceLock<bool> = OnceLock::new();
 static BULK_LABEL_DEDUP: OnceLock<bool> = OnceLock::new();
 static FRONTIER_SHARDING: OnceLock<bool> = OnceLock::new();
+static FRONTIER_DIRECT_DEDUP: OnceLock<bool> = OnceLock::new();
+static FRONTIER_CANONICAL_REPRESENTATIVE: OnceLock<bool> = OnceLock::new();
 static FRONTIER_SHARDS: OnceLock<usize> = OnceLock::new();
 static FRONTIER_SHARDING_MIN_LEVEL: OnceLock<usize> = OnceLock::new();
 static RUN35_COMPAT: OnceLock<bool> = OnceLock::new();
@@ -61,6 +63,8 @@ static RUN_PROFILE_LOG: OnceLock<bool> = OnceLock::new();
 static GOOD_SHARDING: OnceLock<bool> = OnceLock::new();
 static GOOD_SHARDS: OnceLock<usize> = OnceLock::new();
 static GOOD_FINAL_MERGE: OnceLock<bool> = OnceLock::new();
+static FINALIZE_CHECKPOINT_LABELS: OnceLock<bool> = OnceLock::new();
+static CTRLC_HANDLER_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn env_bool(name: &str, default: bool) -> bool {
     match env::var(name) {
@@ -119,6 +123,13 @@ fn good_final_merge_enabled() -> bool {
     *GOOD_FINAL_MERGE.get_or_init(|| env_bool_negated("GOOD_FINAL_MERGE", false))
 }
 
+fn finalize_checkpoint_labels_enabled() -> bool {
+    if run35_compat_enabled() {
+        return true;
+    }
+    *FINALIZE_CHECKPOINT_LABELS.get_or_init(|| env_bool("FINALIZE_CHECKPOINT_LABELS", false))
+}
+
 fn batch_merge_inserts_enabled() -> bool {
     if run35_compat_enabled() {
         return false;
@@ -169,6 +180,21 @@ fn frontier_sharding_enabled() -> bool {
         return false;
     }
     *FRONTIER_SHARDING.get_or_init(|| env_bool("FRONTIER_SHARDING", true))
+}
+
+fn frontier_direct_dedup_enabled() -> bool {
+    if run35_compat_enabled() {
+        return false;
+    }
+    *FRONTIER_DIRECT_DEDUP.get_or_init(|| env_bool("FRONTIER_DIRECT_DEDUP", false))
+}
+
+fn frontier_canonical_representative_enabled() -> bool {
+    if run35_compat_enabled() {
+        return false;
+    }
+    *FRONTIER_CANONICAL_REPRESENTATIVE
+        .get_or_init(|| env_bool("FRONTIER_CANONICAL_REPRESENTATIVE", false))
 }
 
 fn frontier_shards() -> usize {
@@ -248,12 +274,12 @@ fn test_up_to_for_log() -> String {
     }
 }
 
-enum DedupSet {
-    Std(HashSet<U256>),
-    Fx(HashSet<U256, FxBuildHasher>),
+enum DedupSet<T: Eq + Hash> {
+    Std(HashSet<T>),
+    Fx(HashSet<T, FxBuildHasher>),
 }
 
-impl DedupSet {
+impl<T: Eq + Hash> DedupSet<T> {
     fn with_capacity(cap: usize, fast: bool) -> Self {
         if fast {
             DedupSet::Fx(HashSet::with_capacity_and_hasher(cap, FxBuildHasher::default()))
@@ -262,7 +288,7 @@ impl DedupSet {
         }
     }
 
-    fn insert(&mut self, val: U256) -> bool {
+    fn insert(&mut self, val: T) -> bool {
         match self {
             DedupSet::Std(s) => s.insert(val),
             DedupSet::Fx(s) => s.insert(val),
@@ -283,11 +309,11 @@ enum LabelInsertMode<'a> {
     Sharded(Vec<rusqlite::Statement<'a>>),
 }
 
-struct SourceCursor {
+struct SourceCursor<B: BitBackend> {
     conn: Connection,
     path: String,
     last_id: i64,
-    buf: Vec<(i64, U256)>,
+    buf: Vec<(i64, B)>,
     pos: usize,
     exhausted: bool,
 }
@@ -308,9 +334,12 @@ fn tempgood_shard_path(shard: usize) -> String {
     format!("tempgood_s{:02}.db", shard)
 }
 
-fn goodcplx_shard_path(shard: usize) -> String {
-    let n = *N.lock().unwrap();
-    format!("cplxs{}_good_part_{:02}.db", n, shard)
+fn db_stem(db_name: &str) -> String {
+    db_name.strip_suffix(".db").unwrap_or(db_name).to_string()
+}
+
+fn goodcplx_shard_path(db_stem: &str, shard: usize) -> String {
+    format!("{}_good_part_{:02}.db", db_stem, shard)
 }
 
 fn frontier_input_paths(level: usize) -> Vec<String> {
@@ -329,7 +358,7 @@ fn frontier_input_paths(level: usize) -> Vec<String> {
     vec![tempcplx_path(level)]
 }
 
-fn shard_for_label(label: &U256, shards: usize) -> usize {
+fn shard_for_label<B: BitBackend>(label: &B, shards: usize) -> usize {
     let mut hasher = FxHasher::default();
     label.hash(&mut hasher);
     (hasher.finish() as usize) % shards
@@ -338,10 +367,11 @@ fn shard_for_label(label: &U256, shards: usize) -> usize {
 fn initialize_good_shards_from_main(
     conn: &Connection,
     num_good_shards: usize,
+    db_stem: &str,
 ) -> rusqlite::Result<()> {
     let mut shard_conns: Vec<Connection> = Vec::with_capacity(num_good_shards);
     for shard in 0..num_good_shards {
-        let shard_path = goodcplx_shard_path(shard);
+        let shard_path = goodcplx_shard_path(db_stem, shard);
         let shard_conn = Connection::open(&shard_path)?;
         tune_sqlite_main(&shard_conn)?;
         shard_conn.execute(
@@ -381,15 +411,20 @@ fn initialize_good_shards_from_main(
     Ok(())
 }
 
-fn finalize_good_shards(num_good_shards: usize) -> rusqlite::Result<usize> {
+fn finalize_good_shards(num_good_shards: usize, db_stem: &str) -> rusqlite::Result<(usize, FinalizePhaseTimings)> {
+    let total_start = Instant::now();
     let mut inserted_total = 0usize;
+    let mut timings = FinalizePhaseTimings::default();
     for shard in 0..num_good_shards {
         let stage_path = tempgood_shard_path(shard);
         if !Path::new(&stage_path).exists() {
             continue;
         }
+        let checkpoint_start = Instant::now();
         checkpoint_temp_db(&stage_path)?;
-        let good_path = goodcplx_shard_path(shard);
+        timings.checkpoint_ms += checkpoint_start.elapsed().as_millis();
+        let good_path = goodcplx_shard_path(db_stem, shard);
+        let setup_start = Instant::now();
         let good_conn = Connection::open(&good_path)?;
         tune_sqlite_main(&good_conn)?;
         good_conn.execute(
@@ -399,7 +434,11 @@ fn finalize_good_shards(num_good_shards: usize) -> rusqlite::Result<usize> {
             )",
             [],
         )?;
+        timings.setup_ms += setup_start.elapsed().as_millis();
+        let attach_start = Instant::now();
         good_conn.execute("ATTACH DATABASE ? AS stagedgood", params![stage_path])?;
+        timings.attach_ms += attach_start.elapsed().as_millis();
+        let dedup_start = Instant::now();
         good_conn.execute(
             "CREATE TEMP TABLE dedup_good_ids AS
              SELECT MIN(id) AS id
@@ -407,6 +446,8 @@ fn finalize_good_shards(num_good_shards: usize) -> rusqlite::Result<usize> {
              GROUP BY cplx",
             [],
         )?;
+        timings.dedup_ms += dedup_start.elapsed().as_millis();
+        let insert_start = Instant::now();
         let inserted = good_conn.execute(
             "INSERT OR IGNORE INTO goodcplxs (cplx, id)
              SELECT s.cplx, s.id
@@ -415,16 +456,20 @@ fn finalize_good_shards(num_good_shards: usize) -> rusqlite::Result<usize> {
              ORDER BY s.id",
             [],
         )?;
+        timings.insert_ms += insert_start.elapsed().as_millis();
         inserted_total += inserted;
+        let cleanup_start = Instant::now();
         good_conn.execute("DROP TABLE dedup_good_ids", [])?;
         good_conn.execute("DETACH DATABASE stagedgood", [])?;
         drop(good_conn);
         remove_sqlite_artifacts(&stage_path);
+        timings.cleanup_ms += cleanup_start.elapsed().as_millis();
     }
-    Ok(inserted_total)
+    timings.total_ms = total_start.elapsed().as_millis();
+    Ok((inserted_total, timings))
 }
 
-fn merge_good_shards_into_main(conn: &Connection, num_good_shards: usize) -> rusqlite::Result<()> {
+fn merge_good_shards_into_main(conn: &Connection, num_good_shards: usize, db_stem: &str) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS goodcplxs (
             cplx BLOB PRIMARY KEY,
@@ -433,7 +478,7 @@ fn merge_good_shards_into_main(conn: &Connection, num_good_shards: usize) -> rus
         [],
     )?;
     for shard in 0..num_good_shards {
-        let good_path = goodcplx_shard_path(shard);
+        let good_path = goodcplx_shard_path(db_stem, shard);
         if !Path::new(&good_path).exists() {
             continue;
         }
@@ -448,13 +493,13 @@ fn merge_good_shards_into_main(conn: &Connection, num_good_shards: usize) -> rus
     Ok(())
 }
 
-fn fetch_source_batch(
+fn fetch_source_batch<B: BitBackend>(
     conn: &Connection,
     level: usize,
     last_id: i64,
     limit: usize,
-    n2: usize,
-) -> Result<Vec<(i64, U256)>, RusqliteError> {
+    holder: &DataHolder<B>,
+) -> Result<Vec<(i64, B)>, RusqliteError> {
     let select_sql = format!(
         "SELECT id, cplx FROM cplxs{} WHERE id > ?1 ORDER BY id LIMIT ?2",
         level
@@ -463,14 +508,48 @@ fn fetch_source_batch(
     let rows_iter = stmt.query_map(params![last_id, limit as i64], |row| {
         let id: i64 = row.get(0)?;
         let cplx_blob: Vec<u8> = row.get(1)?;
-        Ok((id, decode_temp_blob(&cplx_blob, n2)))
+        Ok((id, decode_temp_bits(&cplx_blob, holder)))
     })?;
     rows_iter.collect()
 }
 
 pub mod functions;
 mod u256;
-use u256::U256;
+use u256::{BitBackend, U256, U768};
+
+fn u256_to_bits<B: BitBackend>(val: &U256) -> B {
+    debug_assert!(B::FITS_U256);
+    B::from_u256(*val)
+}
+
+fn bits_to_u256<B: BitBackend>(val: &B) -> U256 {
+    debug_assert!(B::FITS_U256);
+    val.to_u256()
+}
+
+fn encode_temp_bits<B: BitBackend>(val: &B, holder: &DataHolder<B>) -> Vec<u8> {
+    if B::FITS_U256 {
+        encode_temp_blob(&bits_to_u256(val), *holder.n2)
+    } else {
+        encode_temp_blob_wide(val, *holder.n2, &holder.ultra_binom)
+    }
+}
+
+fn encode_main_bits<B: BitBackend>(val: &B, holder: &DataHolder<B>) -> Vec<u8> {
+    if B::FITS_U256 {
+        int_to_blob(&bits_to_u256(val))
+    } else {
+        int_to_blob_wide(val, active_square_bytes(*holder.n2))
+    }
+}
+
+fn decode_temp_bits<B: BitBackend>(blob: &[u8], holder: &DataHolder<B>) -> B {
+    if B::FITS_U256 {
+        u256_to_bits(&decode_temp_blob(blob, *holder.n2))
+    } else {
+        decode_temp_blob_wide(blob, *holder.n2, &holder.ultra_binom)
+    }
+}
 
 // RUSQLITE ERROR TO PYTHON ERROR:
 
@@ -612,6 +691,33 @@ fn tune_sqlite_temp(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(&pragma)
 }
 
+fn tune_sqlite_finalize_output(conn: &Connection) -> rusqlite::Result<()> {
+    let cache_size = env_i64(
+        "FINALIZE_CACHE_SIZE",
+        match RUN_MODE {
+            RunMode::Safe => -100000,
+            RunMode::Fast => -200000,
+        },
+    );
+    let mmap_size = env_u64(
+        "FINALIZE_MMAP_SIZE",
+        match RUN_MODE {
+            RunMode::Safe => 268435456,
+            RunMode::Fast => 1073741824,
+        },
+    );
+    let pragma = format!(
+        "
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = {cache_size};
+            PRAGMA mmap_size = {mmap_size};
+        "
+    );
+    conn.execute_batch(&pragma)
+}
+
 fn checkpoint_temp_db(path: &str) -> rusqlite::Result<()> {
     let conn = Connection::open(path)?;
     tune_sqlite_temp(&conn)?;
@@ -635,56 +741,81 @@ fn remove_sqlite_artifacts(db_path: &str) {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+struct FinalizePhaseTimings {
+    setup_ms: u128,
+    checkpoint_ms: u128,
+    attach_ms: u128,
+    dedup_ms: u128,
+    insert_ms: u128,
+    rename_ms: u128,
+    cleanup_ms: u128,
+    total_ms: u128,
+}
+
+fn rename_sqlite_artifacts(from_path: &str, to_path: &str) -> rusqlite::Result<()> {
+    remove_sqlite_artifacts(to_path);
+    for suffix in ["", "-wal", "-shm"] {
+        let from = format!("{from_path}{suffix}");
+        let to = format!("{to_path}{suffix}");
+        let path = Path::new(&from);
+        if path.exists() {
+            rename(path, Path::new(&to))
+                .map_err(|e| RusqliteError::ToSqlConversionFailure(Box::new(e)))?;
+        }
+    }
+    Ok(())
+}
+
 // GLOBAL VARIABLES AND PRECOMPUTED FUNCTIONS
 
-pub struct DataHolder {
+pub struct DataHolder<B: BitBackend = U256> {
+    n_dim: Arc<usize>,
     n2: Arc<usize>,
     n1: Arc<usize>,
     n0: Arc<usize>,
     chunksize: Arc<usize>,
-    boundaries: Arc<Vec<U256>>,
-    bboundaries: Arc<Vec<U256>>,
-    edgeboundaries: Arc<Vec<U256>>,
+    boundaries: Arc<Vec<B>>,
+    bboundaries: Arc<Vec<B>>,
+    edgeboundaries: Arc<Vec<B>>,
     nnbhd: Arc<Vec<Vec<usize>>>,
-    permlist: Arc<Vec<Vec<Vec<usize>>>>,
+    permlist_cache: Arc<RwLock<FxHashMap<usize, Arc<Vec<Vec<usize>>>>>>,
     cubes: Arc<Vec<Vec<usize>>>,
-    faceperm_flat: Arc<HashMap<(Vec<usize>, Vec<usize>), Vec<usize>>>,
-    faceperm_by_cube: Arc<Vec<HashMap<Vec<usize>, Vec<usize>>>>,
-    edgesquares: Arc<Vec<U256>>,
-    cycles3: Arc<Vec<Vec<U256>>>,
-    cycles4: Arc<Vec<Vec<U256>>>
+    squares2: Arc<Vec<Vec<usize>>>,
+    square_index: Arc<FxHashMap<Vec<usize>, usize>>,
+    faceperm_cache: Arc<RwLock<FxHashMap<(usize, Vec<usize>), Arc<Vec<usize>>>>>,
+    edgesquares: Arc<Vec<B>>,
+    cycles3: Arc<Vec<Vec<B>>>,
+    cycles4: Arc<Vec<Vec<B>>>,
+    cycles5: Arc<Vec<Vec<B>>>,
+    ultra_binom: Arc<Vec<Vec<B>>>,
 }
 
-impl DataHolder {
+impl<B: BitBackend> DataHolder<B> {
     pub fn new(
+        n_dim: usize,
         n2: usize,
         n1: usize,
         n0: usize,
         chunksize: usize,
-        boundaries: Vec<U256>,
-        bboundaries: Vec<U256>,
-        edgeboundaries: Vec<U256>,
+        boundaries: Vec<B>,
+        bboundaries: Vec<B>,
+        edgeboundaries: Vec<B>,
         nnbhd: Vec<Vec<usize>>,
-        permlist: Vec<Vec<Vec<usize>>>,
         cubes: Vec<Vec<usize>>,
-        faceperm: HashMap<(Vec<usize>, Vec<usize>), Vec<usize>>,
-        edgesquares: Vec<U256>,
-        cycles3: Vec<Vec<U256>>,
-        cycles4: Vec<Vec<U256>>
+        edgesquares: Vec<B>,
+        cycles3: Vec<Vec<B>>,
+        cycles4: Vec<Vec<B>>,
+        cycles5: Vec<Vec<B>>,
+        ultra_binom: Vec<Vec<B>>,
     ) -> Self {
-        let faceperm_flat = faceperm.clone();
-        let mut cube_to_index: HashMap<Vec<usize>, usize> = HashMap::with_capacity(cubes.len());
-        for (idx, cube) in cubes.iter().enumerate() {
-            cube_to_index.insert(cube.clone(), idx);
-        }
-        let mut faceperm_by_cube: Vec<HashMap<Vec<usize>, Vec<usize>>> =
-            (0..cubes.len()).map(|_| HashMap::new()).collect();
-        for ((cube, tau), perm) in faceperm {
-            if let Some(&idx) = cube_to_index.get(&cube) {
-                faceperm_by_cube[idx].insert(tau, perm);
-            }
+        let squares2 = generate_cubes_of_dim(n_dim, 2);
+        let mut square_index = FxHashMap::default();
+        for (idx, cube) in squares2.iter().enumerate() {
+            square_index.insert(cube.clone(), idx);
         }
         DataHolder {
+            n_dim: Arc::new(n_dim),
             n2: Arc::new(n2),
             n1: Arc::new(n1),
             n0: Arc::new(n0),
@@ -693,25 +824,185 @@ impl DataHolder {
             bboundaries: Arc::new(bboundaries),
             edgeboundaries: Arc::new(edgeboundaries),
             nnbhd: Arc::new(nnbhd),
-            permlist: Arc::new(permlist),
+            permlist_cache: Arc::new(RwLock::new(FxHashMap::default())),
             cubes: Arc::new(cubes),
-            faceperm_flat: Arc::new(faceperm_flat),
-            faceperm_by_cube: Arc::new(faceperm_by_cube),
+            squares2: Arc::new(squares2),
+            square_index: Arc::new(square_index),
+            faceperm_cache: Arc::new(RwLock::new(FxHashMap::default())),
             edgesquares: Arc::new(edgesquares),
             cycles3: Arc::new(cycles3),
-            cycles4: Arc::new(cycles4)
+            cycles4: Arc::new(cycles4),
+            cycles5: Arc::new(cycles5),
+            ultra_binom: Arc::new(ultra_binom),
         }
     }
 
-    pub fn get_faceperm(&self, key: &(Vec<usize>, Vec<usize>)) -> &Vec<usize> {
-        self.faceperm_flat.get(key).expect("Failure.")
+    pub fn get_faceperm_for(&self, cube_idx: usize, tau: &[usize]) -> Arc<Vec<usize>> {
+        let key = (cube_idx, tau.to_vec());
+        if let Some(existing) = self.faceperm_cache.read().unwrap().get(&key).cloned() {
+            return existing;
+        }
+        let root = &self.cubes[cube_idx];
+        let mut perm = Vec::with_capacity(self.squares2.len());
+        for square in self.squares2.iter() {
+            let renamed = rename_square(square, root, tau, *self.n_dim);
+            perm.push(
+                *self.square_index
+                    .get(&renamed)
+                    .expect("Failure."),
+            );
+        }
+        let computed = Arc::new(perm);
+        let mut cache = self.faceperm_cache.write().unwrap();
+        cache.entry(key).or_insert_with(|| computed.clone()).clone()
     }
 
-    pub fn get_faceperm_for(&self, cube_idx: usize, tau: &[usize]) -> &Vec<usize> {
-        self.faceperm_by_cube[cube_idx]
-            .get(tau)
-            .expect("Failure.")
+    pub fn get_permlist(&self, encoded: usize, arity: usize) -> Arc<Vec<Vec<usize>>> {
+        if let Some(existing) = self
+            .permlist_cache
+            .read()
+            .unwrap()
+            .get(&encoded)
+            .cloned()
+        {
+            return existing;
+        }
+        let computed = Arc::new(build_permlist_for_pattern(encoded, arity));
+        let mut cache = self.permlist_cache.write().unwrap();
+        cache.entry(encoded).or_insert_with(|| computed.clone()).clone()
     }
+}
+
+fn decode_octal_pattern(mut encoded: usize, arity: usize) -> Vec<usize> {
+    let mut digits = vec![0usize; arity];
+    for i in (0..arity).rev() {
+        digits[i] = encoded & 0b111;
+        encoded >>= 3;
+    }
+    digits
+}
+
+fn generate_cubes_of_dim(n: usize, k: usize) -> Vec<Vec<usize>> {
+    fn rec(pos: usize, n: usize, twos_left: usize, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if pos == n {
+            if twos_left == 0 {
+                out.push(cur.clone());
+            }
+            return;
+        }
+        let remaining = n - pos;
+        if twos_left > remaining {
+            return;
+        }
+        for value in 0..=2usize {
+            let new_twos_left = if value == 2 {
+                if twos_left == 0 {
+                    continue;
+                }
+                twos_left - 1
+            } else {
+                twos_left
+            };
+            cur.push(value);
+            rec(pos + 1, n, new_twos_left, cur, out);
+            cur.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut cur = Vec::with_capacity(n);
+    rec(0, n, k, &mut cur, &mut out);
+    out
+}
+
+fn rename_square(square: &[usize], root: &[usize], tau: &[usize], n_dim: usize) -> Vec<usize> {
+    let mut flipped = Vec::with_capacity(n_dim);
+    for i in 0..n_dim {
+        let v = if root[i] == 1 && square[i] <= 1 {
+            1 - square[i]
+        } else {
+            square[i]
+        };
+        flipped.push(v);
+    }
+    tau.iter().map(|&i| flipped[i]).collect()
+}
+
+fn sorting_perm_usize(values: &[usize]) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..values.len()).collect();
+    indices.sort_by_key(|&idx| values[idx]);
+    indices
+}
+
+fn repeat_counts_sorted(values: &[usize], sorted_perm: &[usize]) -> Vec<usize> {
+    let mut counts = Vec::new();
+    let mut last: Option<usize> = None;
+    let mut count = 0usize;
+    for &idx in sorted_perm {
+        let value = values[idx];
+        if last == Some(value) {
+            count += 1;
+        } else {
+            if count > 0 {
+                counts.push(count);
+            }
+            last = Some(value);
+            count = 1;
+        }
+    }
+    if count > 0 {
+        counts.push(count);
+    }
+    counts
+}
+
+fn enumerate_permutations_in_place(items: &mut [usize], start: usize, out: &mut Vec<Vec<usize>>) {
+    if start >= items.len() {
+        out.push(items.to_vec());
+        return;
+    }
+    for i in start..items.len() {
+        items.swap(start, i);
+        enumerate_permutations_in_place(items, start + 1, out);
+        items.swap(start, i);
+    }
+}
+
+fn permutations_of_range(start: usize, len: usize) -> Vec<Vec<usize>> {
+    if len == 0 {
+        return vec![Vec::new()];
+    }
+    let mut items: Vec<usize> = (start..start + len).collect();
+    let mut out = Vec::new();
+    enumerate_permutations_in_place(&mut items, 0, &mut out);
+    out
+}
+
+fn build_permlist_for_pattern(encoded: usize, arity: usize) -> Vec<Vec<usize>> {
+    let digits = decode_octal_pattern(encoded, arity);
+    let pi = sorting_perm_usize(&digits);
+    let counts = repeat_counts_sorted(&digits, &pi);
+
+    let mut grouped: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut offset = 0usize;
+    for count in counts {
+        let block_perms = permutations_of_range(offset, count);
+        let mut next = Vec::with_capacity(grouped.len() * block_perms.len());
+        for prefix in &grouped {
+            for perm in &block_perms {
+                let mut combined = prefix.clone();
+                combined.extend_from_slice(perm);
+                next.push(combined);
+            }
+        }
+        grouped = next;
+        offset += count;
+    }
+
+    grouped
+        .into_iter()
+        .map(|tau| tau.into_iter().map(|i| pi[i]).collect())
+        .collect()
 }
 
 lazy_static! {
@@ -721,34 +1012,35 @@ lazy_static! {
     pub static ref N0: Mutex<usize> = Mutex::new(0);
     pub static ref CHUNKSIZE: Mutex<usize> = Mutex::new(0);
 
-    pub static ref PRECOMPUTED_BOUNDARIES: Mutex<Vec<U256>> = Mutex::new(vec![]);
-    pub static ref PRECOMPUTED_BBOUNDARIES: Mutex<Vec<U256>> = Mutex::new(vec![]);
-    pub static ref PRECOMPUTED_EDGEBOUNDARIES: Mutex<Vec<U256>> = Mutex::new(vec![]);
+    pub static ref PRECOMPUTED_BOUNDARIES: Mutex<Vec<Vec<u128>>> = Mutex::new(vec![]);
+    pub static ref PRECOMPUTED_BBOUNDARIES: Mutex<Vec<Vec<u128>>> = Mutex::new(vec![]);
+    pub static ref PRECOMPUTED_EDGEBOUNDARIES: Mutex<Vec<Vec<u128>>> = Mutex::new(vec![]);
     pub static ref PRECOMPUTED_NNBHD: Mutex<Vec<Vec<usize>>> = Mutex::new(vec![]);
-    pub static ref PRECOMPUTED_PERMLIST: Mutex<Vec<Vec<Vec<usize>>>> = Mutex::new(vec![]);
     pub static ref PRECOMPUTED_CUBES: Mutex<Vec<Vec<usize>>> = Mutex::new(vec![]);
-    pub static ref PRECOMPUTED_FACEPERM: Mutex<HashMap<(Vec<usize>, Vec<usize>), Vec<usize>>> = Mutex::new(HashMap::new());
-    pub static ref PRECOMPUTED_EDGESQUARES: Mutex<Vec<U256>> = Mutex::new(vec![]);
-    pub static ref PRECOMPUTED_CYCLES3: Mutex<Vec<Vec<U256>>> = Mutex::new(vec![]);
-    pub static ref PRECOMPUTED_CYCLES4: Mutex<Vec<Vec<U256>>> = Mutex::new(vec![]);
-    pub static ref ULTRA_BINOM: Vec<Vec<U256>> = {
-        let mut table = vec![vec![U256::zero(); ULTRA_MAX_K + 1]; ULTRA_MAX_N + 1];
-        table[0][0] = U256::from(1u8);
-        for n in 1..=ULTRA_MAX_N {
-            table[n][0] = U256::from(1u8);
-            let max_k = std::cmp::min(n, ULTRA_MAX_K);
-            for k in 1..=max_k {
-                if k == n {
-                    table[n][k] = U256::from(1u8);
-                } else {
-                    let mut v = table[n - 1][k - 1];
-                    v += table[n - 1][k];
-                    table[n][k] = v;
-                }
+    pub static ref PRECOMPUTED_EDGESQUARES: Mutex<Vec<Vec<u128>>> = Mutex::new(vec![]);
+    pub static ref PRECOMPUTED_CYCLES3: Mutex<Vec<Vec<Vec<u128>>>> = Mutex::new(vec![]);
+    pub static ref PRECOMPUTED_CYCLES4: Mutex<Vec<Vec<Vec<u128>>>> = Mutex::new(vec![]);
+    pub static ref PRECOMPUTED_CYCLES5: Mutex<Vec<Vec<Vec<u128>>>> = Mutex::new(vec![]);
+    pub static ref ULTRA_BINOM: Vec<Vec<U256>> = build_ultra_binom::<U256>(ULTRA_MAX_N);
+}
+
+fn build_ultra_binom<B: BitBackend>(max_n: usize) -> Vec<Vec<B>> {
+    let mut table = vec![vec![B::zero(); max_n + 1]; max_n + 1];
+    table[0][0] = B::from(1u8);
+    for n in 1..=max_n {
+        table[n][0] = B::from(1u8);
+        let max_k = n;
+        for k in 1..=max_k {
+            if k == n {
+                table[n][k] = B::from(1u8);
+            } else {
+                let mut v = table[n - 1][k - 1];
+                v += table[n - 1][k];
+                table[n][k] = v;
             }
         }
-        table
-    };
+    }
+    table
 }
 
 #[pyfunction]
@@ -762,12 +1054,11 @@ fn load_precomputed_values(_py: Python,
     bboundaries_values: Vec<Vec<u128>>,    // This fits in a U256 because 2^n vertices require 3*2^n bits to encode.
     edgeboundaries_values: Vec<Vec<u128>>, // This fits in a U256 because 2^n vertices require 3*2^n bits to encode.
     nnbhd_values: Vec<Vec<usize>>,
-    permlist_values: Vec<Vec<Vec<usize>>>,
     cubes_values: Vec<Vec<usize>>,
-    faceperm_values: HashMap<(Vec<usize>, Vec<usize>), Vec<usize>>,
     edgesquares_values: Vec<Vec<u128>>,
     cycles3_values: Vec<Vec<Vec<u128>>>,
-    cycles4_values: Vec<Vec<Vec<u128>>>
+    cycles4_values: Vec<Vec<Vec<u128>>>,
+    cycles5_values: Vec<Vec<Vec<u128>>>
 ) {
     let mut n_ref = N.lock().unwrap();
     let mut n2_ref = N2.lock().unwrap();
@@ -778,73 +1069,102 @@ fn load_precomputed_values(_py: Python,
     let mut precomputed_bboundaries = PRECOMPUTED_BBOUNDARIES.lock().unwrap();
     let mut precomputed_edgeboundaries = PRECOMPUTED_EDGEBOUNDARIES.lock().unwrap();
     let mut precomputed_nnbhd = PRECOMPUTED_NNBHD.lock().unwrap();
-    let mut precomputed_permlist = PRECOMPUTED_PERMLIST.lock().unwrap();
     let mut precomputed_cubes = PRECOMPUTED_CUBES.lock().unwrap();
-    let mut precomputed_faceperm = PRECOMPUTED_FACEPERM.lock().unwrap();
     let mut precomputed_edgesquares = PRECOMPUTED_EDGESQUARES.lock().unwrap();
     let mut precomputed_cycles3 = PRECOMPUTED_CYCLES3.lock().unwrap();
     let mut precomputed_cycles4 = PRECOMPUTED_CYCLES4.lock().unwrap();
-
-    let boundaries_converted: Vec<U256> = boundaries_values.into_iter()
-    .map(|inner_vec| U256::from_u128_vec(inner_vec))
-    .collect();
-    let bboundaries_converted: Vec<U256> = bboundaries_values.into_iter()
-    .map(|inner_vec| U256::from_u128_vec(inner_vec))
-    .collect();
-    let edgeboundaries_converted: Vec<U256> = edgeboundaries_values.into_iter()
-    .map(|inner_vec| U256::from_u128_vec(inner_vec))
-    .collect();
-    let edgesquares_converted: Vec<U256> = edgesquares_values.into_iter()
-    .map(|inner_vec| U256::from_u128_vec(inner_vec))
-    .collect();
-    let cycles3_converted: Vec<Vec<U256>> = cycles3_values.into_iter()
-    .map(|outer_vec| {
-        outer_vec.into_iter()
-            .map(|inner_vec| U256::from_u128_vec(inner_vec))
-            .collect()
-    })
-    .collect();
-    let cycles4_converted: Vec<Vec<U256>> = cycles4_values.into_iter()
-    .map(|outer_vec| {
-        outer_vec.into_iter()
-            .map(|inner_vec| U256::from_u128_vec(inner_vec))
-            .collect()
-    })
-    .collect();
+    let mut precomputed_cycles5 = PRECOMPUTED_CYCLES5.lock().unwrap();
 
     *n_ref = n;
     *n2_ref = n2;
     *n1_ref = n1;
     *n0_ref = n0;
     *chunksize_ref = chunksize;
-    *precomputed_boundaries = boundaries_converted;
-    *precomputed_bboundaries = bboundaries_converted;
-    *precomputed_edgeboundaries = edgeboundaries_converted;
+    *precomputed_boundaries = boundaries_values;
+    *precomputed_bboundaries = bboundaries_values;
+    *precomputed_edgeboundaries = edgeboundaries_values;
     *precomputed_nnbhd = nnbhd_values;
-    *precomputed_permlist = permlist_values;
     *precomputed_cubes = cubes_values;
-    *precomputed_faceperm = faceperm_values;
-    *precomputed_edgesquares = edgesquares_converted;
-    *precomputed_cycles3 = cycles3_converted;
-    *precomputed_cycles4 = cycles4_converted;
+    *precomputed_edgesquares = edgesquares_values;
+    *precomputed_cycles3 = cycles3_values;
+    *precomputed_cycles4 = cycles4_values;
+    *precomputed_cycles5 = cycles5_values;
 }
 
-fn initialize_holder() -> DataHolder {
+fn initialize_holder<B: BitBackend>() -> DataHolder<B> {
     let n2 = *N2.lock().unwrap();
     let n1 = *N1.lock().unwrap();
     let n0 = *N0.lock().unwrap();
+    let n_dim = *N.lock().unwrap();
     let chunksize = *CHUNKSIZE.lock().unwrap();
-    let boundaries = PRECOMPUTED_BOUNDARIES.lock().unwrap().clone();
-    let bboundaries = PRECOMPUTED_BBOUNDARIES.lock().unwrap().clone();
-    let edgeboundaries = PRECOMPUTED_EDGEBOUNDARIES.lock().unwrap().clone();
+    let boundaries = PRECOMPUTED_BOUNDARIES
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|v| B::from_u128_slice(&v))
+        .collect();
+    let bboundaries = PRECOMPUTED_BBOUNDARIES
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|v| B::from_u128_slice(&v))
+        .collect();
+    let edgeboundaries = PRECOMPUTED_EDGEBOUNDARIES
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|v| B::from_u128_slice(&v))
+        .collect();
     let nnbhd = PRECOMPUTED_NNBHD.lock().unwrap().clone();
-    let permlist = PRECOMPUTED_PERMLIST.lock().unwrap().clone();
     let cubes = PRECOMPUTED_CUBES.lock().unwrap().clone();
-    let faceperm = PRECOMPUTED_FACEPERM.lock().unwrap().clone();
-    let edgesquares = PRECOMPUTED_EDGESQUARES.lock().unwrap().clone();
-    let cycles3 = PRECOMPUTED_CYCLES3.lock().unwrap().clone();
-    let cycles4 = PRECOMPUTED_CYCLES4.lock().unwrap().clone();
+    let edgesquares = PRECOMPUTED_EDGESQUARES
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|v| B::from_u128_slice(&v))
+        .collect();
+    let cycles3 = PRECOMPUTED_CYCLES3
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|outer_vec| {
+            outer_vec
+                .into_iter()
+                .map(|v| B::from_u128_slice(&v))
+                .collect()
+        })
+        .collect();
+    let cycles4 = PRECOMPUTED_CYCLES4
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|outer_vec| {
+            outer_vec
+                .into_iter()
+                .map(|v| B::from_u128_slice(&v))
+                .collect()
+        })
+        .collect();
+    let cycles5 = PRECOMPUTED_CYCLES5
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|outer_vec| {
+            outer_vec
+                .into_iter()
+                .map(|v| B::from_u128_slice(&v))
+                .collect()
+        })
+        .collect();
     let holder = DataHolder::new(
+        n_dim,
         n2,
         n1,
         n0,
@@ -853,12 +1173,12 @@ fn initialize_holder() -> DataHolder {
         bboundaries,
         edgeboundaries,
         nnbhd,
-        permlist,
         cubes,
-        faceperm,
         edgesquares,
         cycles3,
-        cycles4
+        cycles4,
+        cycles5,
+        build_ultra_binom::<B>(n2),
     );
     return holder
 }
@@ -1013,14 +1333,11 @@ fn blob_to_int(blob: &[u8]) -> U256 {
 }
 
 fn int_to_blob_raw32(val: &U256) -> Vec<u8> {
-    val.to_be_bytes().to_vec()
+    val.to_be_bytes_vec()
 }
 
 fn blob_to_int_raw32(blob: &[u8]) -> U256 {
-    let mut padded_blob = [0u8; 32];
-    let padding_needed = 32usize.saturating_sub(blob.len());
-    padded_blob[padding_needed..].copy_from_slice(blob);
-    U256::from_be_bytes(padded_blob)
+    U256::from_be_slice(blob)
 }
 
 fn int_to_blob_combinadic(val: &U256, n2: usize) -> Option<Vec<u8>> {
@@ -1043,7 +1360,7 @@ fn int_to_blob_combinadic(val: &U256, n2: usize) -> Option<Vec<u8>> {
         bits ^= U256::one() << p;
     }
 
-    let rank_arr = rank.to_be_bytes();
+    let rank_arr = rank.to_be_bytes_vec();
     let first_nz = rank_arr.iter().position(|&b| b != 0).unwrap_or(rank_arr.len());
     let rank_bytes = &rank_arr[first_nz..];
     let mut out = Vec::with_capacity(3 + rank_bytes.len());
@@ -1071,7 +1388,7 @@ fn blob_to_int_combinadic(blob: &[u8], n2: usize) -> Option<U256> {
     }
     let mut padded = [0u8; 32];
     padded[(32 - len)..].copy_from_slice(&blob[3..]);
-    let mut rank = U256::from_be_bytes(padded);
+    let mut rank = U256::from_be_slice(&padded);
     let mut positions = vec![0usize; k];
     let mut x = n2;
     for j in (1..=k).rev() {
@@ -1162,7 +1479,7 @@ fn encode_temp_blob(val: &U256, n2: usize) -> Vec<u8> {
             } else {
                 let mut out = Vec::with_capacity(1 + 32);
                 out.push(TAG_RAW32);
-                out.extend_from_slice(&val.to_be_bytes());
+                out.extend_from_slice(&val.to_be_bytes_vec());
                 out
             }
         }
@@ -1206,15 +1523,245 @@ fn decode_temp_blob(blob: &[u8], n2: usize) -> U256 {
     }
 }
 
-fn process_chunk(
+fn main_mask_bytes(byte_width: usize) -> usize {
+    (byte_width + 7) / 8
+}
+
+fn active_square_bytes(n2: usize) -> usize {
+    (n2 + 7) / 8
+}
+
+fn int_to_blob_wide<B: BitBackend>(val: &B, byte_width: usize) -> Vec<u8> {
+    let pos_bytes = main_mask_bytes(byte_width);
+    let be = val.to_be_bytes_vec();
+    let mut payload = Vec::new();
+    let mut pos = vec![0u8; pos_bytes];
+    for (i, &byte) in be[be.len() - byte_width..].iter().rev().enumerate() {
+        if byte != 0 {
+            pos[i / 8] |= 1u8 << (i % 8);
+            payload.push(byte);
+        }
+    }
+    payload.extend_from_slice(&pos);
+    payload
+}
+
+fn blob_to_int_wide<B: BitBackend>(blob: &[u8], byte_width: usize) -> B {
+    let pos_bytes = main_mask_bytes(byte_width);
+    if blob.len() < pos_bytes {
+        return B::zero();
+    }
+    let split = blob.len() - pos_bytes;
+    let payload = &blob[..split];
+    let pos = &blob[split..];
+    let full_width = B::BIT_WIDTH / 8;
+    let mut be = vec![0u8; full_width];
+    let mut payload_index = 0usize;
+    for i in 0..byte_width {
+        if ((pos[i / 8] >> (i % 8)) & 1u8) != 0 {
+            if payload_index >= payload.len() {
+                break;
+            }
+            be[full_width - 1 - i] = payload[payload_index];
+            payload_index += 1;
+        }
+    }
+    B::from_be_slice(&be)
+}
+
+fn int_to_blob_raw_wide<B: BitBackend>(val: &B) -> Vec<u8> {
+    val.to_be_bytes_vec()
+}
+
+fn blob_to_int_raw_wide<B: BitBackend>(blob: &[u8]) -> B {
+    B::from_be_slice(blob)
+}
+
+fn int_to_blob_sparse_wide<B: BitBackend>(val: &B, byte_width: usize) -> Vec<u8> {
+    let pos_bytes = main_mask_bytes(byte_width);
+    let be = val.to_be_bytes_vec();
+    let mut payload = Vec::new();
+    let mut out = Vec::with_capacity(1 + pos_bytes + byte_width);
+    out.push(TAG_SPARSE);
+    let mut pos = vec![0u8; pos_bytes];
+    for (i, &byte) in be[be.len() - byte_width..].iter().rev().enumerate() {
+        if byte != 0 {
+            pos[i / 8] |= 1u8 << (i % 8);
+            payload.push(byte);
+        }
+    }
+    out.extend_from_slice(&pos);
+    out.extend_from_slice(&payload);
+    out
+}
+
+fn blob_to_int_sparse_wide<B: BitBackend>(blob: &[u8], byte_width: usize) -> B {
+    let pos_bytes = main_mask_bytes(byte_width);
+    if blob.len() < 1 + pos_bytes {
+        return B::zero();
+    }
+    let pos = &blob[1..1 + pos_bytes];
+    let payload = &blob[1 + pos_bytes..];
+    let full_width = B::BIT_WIDTH / 8;
+    let mut be = vec![0u8; full_width];
+    let mut payload_index = 0usize;
+    for i in 0..byte_width {
+        if ((pos[i / 8] >> (i % 8)) & 1u8) != 0 {
+            if payload_index >= payload.len() {
+                break;
+            }
+            be[full_width - 1 - i] = payload[payload_index];
+            payload_index += 1;
+        }
+    }
+    B::from_be_slice(&be)
+}
+
+fn nonzero_byte_count_wide<B: BitBackend>(val: &B, byte_width: usize) -> usize {
+    let be = val.to_be_bytes_vec();
+    be[be.len() - byte_width..]
+        .iter()
+        .filter(|&&b| b != 0)
+        .count()
+}
+
+fn int_to_blob_combinadic_wide<B: BitBackend>(val: &B, n2: usize, ultra_binom: &[Vec<B>]) -> Option<Vec<u8>> {
+    let mut bits = *val;
+    let mut k = 0usize;
+    let mut rank = B::zero();
+    while bits != B::zero() {
+        let p = bits.trailing_zeros() as usize;
+        if p >= n2 {
+            break;
+        }
+        k += 1;
+        rank += ultra_binom[p][k];
+        bits ^= B::one() << p;
+    }
+    let rank_arr = rank.to_be_bytes_vec();
+    let first_nz = rank_arr.iter().position(|&b| b != 0).unwrap_or(rank_arr.len());
+    let rank_bytes = &rank_arr[first_nz..];
+    let mut out = Vec::with_capacity(3 + rank_bytes.len());
+    out.push(TAG_COMBINADIC);
+    out.push(k as u8);
+    out.push(rank_bytes.len() as u8);
+    out.extend_from_slice(rank_bytes);
+    Some(out)
+}
+
+fn blob_to_int_combinadic_wide<B: BitBackend>(blob: &[u8], n2: usize, ultra_binom: &[Vec<B>]) -> Option<B> {
+    if blob.len() < 3 {
+        return None;
+    }
+    let k = blob[1] as usize;
+    let len = blob[2] as usize;
+    if blob.len() != 3 + len {
+        return None;
+    }
+    let byte_width = B::BIT_WIDTH / 8;
+    if len > byte_width {
+        return None;
+    }
+    let mut padded = vec![0u8; byte_width];
+    padded[(byte_width - len)..].copy_from_slice(&blob[3..]);
+    let mut rank = B::from_be_slice(&padded);
+    let mut positions = vec![0usize; k];
+    let mut x = n2;
+    for j in (1..=k).rev() {
+        if x == 0 {
+            return None;
+        }
+        let mut cand = x - 1;
+        while ultra_binom[cand][j] > rank {
+            if cand == 0 {
+                return None;
+            }
+            cand -= 1;
+        }
+        rank -= ultra_binom[cand][j];
+        positions[j - 1] = cand;
+        x = cand;
+    }
+    let mut out = B::zero();
+    for p in positions {
+        out |= B::one() << p;
+    }
+    Some(out)
+}
+
+fn encode_temp_blob_wide<B: BitBackend>(val: &B, n2: usize, ultra_binom: &[Vec<B>]) -> Vec<u8> {
+    let byte_width = active_square_bytes(n2);
+    match TEMP_ENCODING_MODE {
+        TempEncodingMode::Compressed => int_to_blob_wide(val, byte_width),
+        TempEncodingMode::Raw32 => int_to_blob_raw_wide(val),
+        TempEncodingMode::Adaptive => {
+            let nnz = nonzero_byte_count_wide(val, byte_width);
+            if nnz <= ADAPTIVE_SPARSE_MAX_NONZERO {
+                int_to_blob_sparse_wide(val, byte_width)
+            } else {
+                let be = val.to_be_bytes_vec();
+                let mut out = Vec::with_capacity(1 + byte_width);
+                out.push(TAG_RAW32);
+                out.extend_from_slice(&be[be.len() - byte_width..]);
+                out
+            }
+        }
+        TempEncodingMode::Combinadic => {
+            if let Some(b) = int_to_blob_combinadic_wide(val, n2, ultra_binom) {
+                b
+            } else {
+                let mut out = Vec::new();
+                out.push(TAG_COMP_FALLBACK);
+                out.extend_from_slice(&int_to_blob_wide(val, byte_width));
+                out
+            }
+        }
+    }
+}
+
+fn decode_temp_blob_wide<B: BitBackend>(blob: &[u8], n2: usize, ultra_binom: &[Vec<B>]) -> B {
+    let active_bytes = active_square_bytes(n2);
+    match TEMP_ENCODING_MODE {
+        TempEncodingMode::Compressed => blob_to_int_wide(blob, active_bytes),
+        TempEncodingMode::Raw32 => blob_to_int_raw_wide(blob),
+        TempEncodingMode::Adaptive => {
+            if blob.is_empty() {
+                return B::zero();
+            }
+            match blob[0] {
+                TAG_SPARSE => blob_to_int_sparse_wide(blob, active_bytes),
+                TAG_RAW32 => blob_to_int_raw_wide(&blob[1..]),
+                _ => blob_to_int_wide(blob, active_bytes),
+            }
+        }
+        TempEncodingMode::Combinadic => {
+            if blob.is_empty() {
+                return B::zero();
+            }
+            match blob[0] {
+                TAG_COMBINADIC => blob_to_int_combinadic_wide(blob, n2, ultra_binom).unwrap_or_else(B::zero),
+                TAG_COMP_FALLBACK => blob_to_int_wide(&blob[1..], active_bytes),
+                _ => {
+                    if blob.len() == active_bytes {
+                        B::from_be_slice(blob)
+                    } else {
+                        blob_to_int_wide(blob, active_bytes)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn process_chunk<B: BitBackend>(
     label_mode: &mut LabelInsertMode<'_>,
     stmt2: Option<&mut rusqlite::Statement<'_>>,
     stage_stmt1: Option<&mut rusqlite::Statement<'_>>,
     stage_stmt2: Option<&mut rusqlite::Statement<'_>>,
     stage_good_stmt: Option<&mut rusqlite::Statement<'_>>,
     good_shard_stmts: Option<&mut Vec<rusqlite::Statement<'_>>>,
-    holder: &DataHolder,
-    chunk: &[U256],
+    holder: &DataHolder<B>,
+    chunk: &[B],
     nall: &mut usize,
     ngood: &mut usize,
     dbprefix: &String,
@@ -1224,6 +1771,8 @@ fn process_chunk(
     use_good_sharding: bool,
     use_bulk_label_dedup: bool,
     use_frontier_sharding: bool,
+    use_frontier_direct_dedup: bool,
+    use_frontier_canonical_representative: bool,
     num_frontier_shards: usize,
     num_good_shards: usize,
 ) -> rusqlite::Result<ChunkProfile> {
@@ -1232,7 +1781,7 @@ fn process_chunk(
         D,
         Plain,
     }
-    let extend_fun: fn(&U256, &DataHolder) -> Vec<U256> = if dbprefix == "db" {
+    let extend_fun: fn(&B, &DataHolder<B>) -> Vec<B> = if dbprefix == "db" {
         functions::disconnected_withbdry_extendonce
     } else if dbprefix == "b" {
         functions::withbdry_extendonce
@@ -1254,7 +1803,7 @@ fn process_chunk(
     let check_links = check_vertex_links_enabled();
     let reuse_vertex_codes = reuse_vertex_codes_enabled();
     let analyze_start = Instant::now();
-    let (generated, analyzed): (usize, Vec<(U256, U256, bool, bool)>) = chunk
+    let (generated, analyzed): (usize, Vec<(B, B, bool, bool)>) = chunk
         .into_par_iter()
         .fold(
             || (0usize, Vec::new()),
@@ -1369,61 +1918,122 @@ fn process_chunk(
     let use_fast_hash_dedup = fast_hash_dedup_enabled();
     let mut seen_labeled = DedupSet::with_capacity(analyzed.len(), use_fast_hash_dedup);
     let mut seen_good = DedupSet::with_capacity(analyzed.len() / 8 + 1, use_fast_hash_dedup);
-    let mut label_blob_cache: FxHashMap<U256, Vec<u8>> = FxHashMap::default();
-    let mut cplx_blob_cache: FxHashMap<U256, Vec<u8>> = FxHashMap::default();
-    let mut good_blob_cache: FxHashMap<U256, Vec<u8>> = FxHashMap::default();
+    let mut label_blob_cache: FxHashMap<B, Vec<u8>> = FxHashMap::default();
+    let mut cplx_blob_cache: FxHashMap<B, Vec<u8>> = FxHashMap::default();
+    let mut good_blob_cache: FxHashMap<B, Vec<u8>> = FxHashMap::default();
     if use_batch_merge_inserts {
         let stage1 = stage_stmt1.expect("Batch mode requires stage stmt1.");
         let stage2 = stage_stmt2.expect("Batch mode requires stage stmt2.");
         for (val1, val2, keep_labeled, keep_good) in analyzed.iter() {
             if *keep_labeled && seen_labeled.insert(*val1) {
                 *nall += 1;
-                inserted_labeled += 1;
+                let frontier_rep = if use_frontier_canonical_representative { *val1 } else { *val2 };
+                if !(use_frontier_sharding && use_frontier_direct_dedup) {
+                    inserted_labeled += 1;
+                }
                 if use_blob_encode_cache {
-                    let label_blob = label_blob_cache
-                        .entry(*val1)
-                        .or_insert_with(|| encode_temp_blob(val1, *holder.n2));
                     let cplx_blob = cplx_blob_cache
-                        .entry(*val2)
-                        .or_insert_with(|| encode_temp_blob(val2, *holder.n2));
-                    if use_frontier_sharding {
-                        let shard = shard_for_label(val1, num_frontier_shards);
-                        match label_mode {
-                            LabelInsertMode::Sharded(stmts) => {
-                                stmts[shard].execute(params![*nall, &*label_blob, &*cplx_blob])?;
+                        .entry(frontier_rep)
+                        .or_insert_with(|| encode_temp_bits(&frontier_rep, holder));
+                    if use_frontier_canonical_representative {
+                        if use_frontier_sharding {
+                            let shard = shard_for_label(val1, num_frontier_shards);
+                            match label_mode {
+                                LabelInsertMode::Sharded(stmts) => {
+                                    let affected =
+                                        stmts[shard].execute(params![*nall, &*cplx_blob])?;
+                                    if use_frontier_direct_dedup {
+                                        inserted_labeled += affected;
+                                    }
+                                }
+                                LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
                             }
-                            LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
-                        }
-                    } else if use_bulk_label_dedup {
-                        match label_mode {
-                            LabelInsertMode::Single(stmt1) => {
-                                stmt1.execute(params![*nall, &*label_blob, &*cplx_blob])?;
+                        } else if use_bulk_label_dedup {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![*nall, &*cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
                             }
-                            LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
+                        } else {
+                            stage1.execute(params![&*cplx_blob, *nall])?;
                         }
                     } else {
-                        stage1.execute(params![&*label_blob, *nall, &*cplx_blob])?;
+                        let label_blob = label_blob_cache
+                            .entry(*val1)
+                            .or_insert_with(|| encode_temp_bits(val1, holder));
+                        if use_frontier_sharding {
+                            let shard = shard_for_label(val1, num_frontier_shards);
+                            match label_mode {
+                                LabelInsertMode::Sharded(stmts) => {
+                                    let affected =
+                                        stmts[shard].execute(params![*nall, &*label_blob, &*cplx_blob])?;
+                                    if use_frontier_direct_dedup {
+                                        inserted_labeled += affected;
+                                    }
+                                }
+                                LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
+                            }
+                        } else if use_bulk_label_dedup {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![*nall, &*label_blob, &*cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
+                            }
+                        } else {
+                            stage1.execute(params![&*label_blob, *nall, &*cplx_blob])?;
+                        }
                     }
                 } else {
-                    let label_blob = encode_temp_blob(val1, *holder.n2);
-                    let cplx_blob = encode_temp_blob(val2, *holder.n2);
-                    if use_frontier_sharding {
-                        let shard = shard_for_label(val1, num_frontier_shards);
-                        match label_mode {
-                            LabelInsertMode::Sharded(stmts) => {
-                                stmts[shard].execute(params![*nall, label_blob, cplx_blob])?;
+                    let cplx_blob = encode_temp_bits(&frontier_rep, holder);
+                    if use_frontier_canonical_representative {
+                        if use_frontier_sharding {
+                            let shard = shard_for_label(val1, num_frontier_shards);
+                            match label_mode {
+                                LabelInsertMode::Sharded(stmts) => {
+                                    let affected =
+                                        stmts[shard].execute(params![*nall, cplx_blob])?;
+                                    if use_frontier_direct_dedup {
+                                        inserted_labeled += affected;
+                                    }
+                                }
+                                LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
                             }
-                            LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
-                        }
-                    } else if use_bulk_label_dedup {
-                        match label_mode {
-                            LabelInsertMode::Single(stmt1) => {
-                                stmt1.execute(params![*nall, label_blob, cplx_blob])?;
+                        } else if use_bulk_label_dedup {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![*nall, cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
                             }
-                            LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
+                        } else {
+                            stage1.execute(params![cplx_blob, *nall])?;
                         }
                     } else {
-                        stage1.execute(params![label_blob, *nall, cplx_blob])?;
+                        let label_blob = encode_temp_bits(val1, holder);
+                        if use_frontier_sharding {
+                            let shard = shard_for_label(val1, num_frontier_shards);
+                            match label_mode {
+                                LabelInsertMode::Sharded(stmts) => {
+                                    let affected =
+                                        stmts[shard].execute(params![*nall, label_blob, cplx_blob])?;
+                                    if use_frontier_direct_dedup {
+                                        inserted_labeled += affected;
+                                    }
+                                }
+                                LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
+                            }
+                        } else if use_bulk_label_dedup {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![*nall, label_blob, cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
+                            }
+                        } else {
+                            stage1.execute(params![label_blob, *nall, cplx_blob])?;
+                        }
                     }
                 }
             }
@@ -1431,13 +2041,13 @@ fn process_chunk(
                 *ngood += 1;
                 inserted_good += 1;
                 if use_blob_encode_cache {
-                    let good_blob = good_blob_cache
-                        .entry(*val1)
-                        .or_insert_with(|| int_to_blob(val1));
+                        let good_blob = good_blob_cache
+                            .entry(*val1)
+                            .or_insert_with(|| encode_main_bits(val1, holder));
                     stage2.execute(params![&*good_blob, *ngood])?;
                 } else {
                     stage2.execute(
-                        params![int_to_blob(val1), *ngood]
+                        params![encode_main_bits(val1, holder), *ngood]
                     )?;
                 }
             }
@@ -1449,62 +2059,133 @@ fn process_chunk(
         for (val1, val2, keep_labeled, keep_good) in analyzed.iter() {
             if *keep_labeled && seen_labeled.insert(*val1) {
                 *nall += 1;
-                inserted_labeled += 1;
+                let frontier_rep = if use_frontier_canonical_representative { *val1 } else { *val2 };
+                if !(use_frontier_sharding && use_frontier_direct_dedup) {
+                    inserted_labeled += 1;
+                }
                 // `nall` becomes the append-order sequence in bulk dedup mode.
                 if use_blob_encode_cache {
-                    let label_blob = label_blob_cache
-                        .entry(*val1)
-                        .or_insert_with(|| encode_temp_blob(val1, *holder.n2));
                     let cplx_blob = cplx_blob_cache
-                        .entry(*val2)
-                        .or_insert_with(|| encode_temp_blob(val2, *holder.n2));
-                    if use_frontier_sharding {
-                        let shard = shard_for_label(val1, num_frontier_shards);
-                        match label_mode {
-                            LabelInsertMode::Sharded(stmts) => {
-                                stmts[shard].execute(params![*nall, &*label_blob, &*cplx_blob])?;
+                        .entry(frontier_rep)
+                        .or_insert_with(|| encode_temp_bits(&frontier_rep, holder));
+                    if use_frontier_canonical_representative {
+                        if use_frontier_sharding {
+                            let shard = shard_for_label(val1, num_frontier_shards);
+                            match label_mode {
+                                LabelInsertMode::Sharded(stmts) => {
+                                    let affected =
+                                        stmts[shard].execute(params![*nall, &*cplx_blob])?;
+                                    if use_frontier_direct_dedup {
+                                        inserted_labeled += affected;
+                                    }
+                                }
+                                LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
                             }
-                            LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
-                        }
-                    } else if use_bulk_label_dedup {
-                        match label_mode {
-                            LabelInsertMode::Single(stmt1) => {
-                                stmt1.execute(params![*nall, &*label_blob, &*cplx_blob])?;
+                        } else if use_bulk_label_dedup {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![*nall, &*cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
                             }
-                            LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
+                        } else {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![&*cplx_blob, *nall])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("non-bulk label path uses single label mode"),
+                            }
                         }
                     } else {
-                        match label_mode {
-                            LabelInsertMode::Single(stmt1) => {
-                                stmt1.execute(params![&*label_blob, *nall, &*cplx_blob])?;
+                        let label_blob = label_blob_cache
+                            .entry(*val1)
+                            .or_insert_with(|| encode_temp_bits(val1, holder));
+                        if use_frontier_sharding {
+                            let shard = shard_for_label(val1, num_frontier_shards);
+                            match label_mode {
+                                LabelInsertMode::Sharded(stmts) => {
+                                    let affected =
+                                        stmts[shard].execute(params![*nall, &*label_blob, &*cplx_blob])?;
+                                    if use_frontier_direct_dedup {
+                                        inserted_labeled += affected;
+                                    }
+                                }
+                                LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
                             }
-                            LabelInsertMode::Sharded(_) => unreachable!("non-bulk label path uses single label mode"),
+                        } else if use_bulk_label_dedup {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![*nall, &*label_blob, &*cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
+                            }
+                        } else {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![&*label_blob, *nall, &*cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("non-bulk label path uses single label mode"),
+                            }
                         }
                     }
                 } else {
-                    let label_blob = encode_temp_blob(val1, *holder.n2);
-                    let cplx_blob = encode_temp_blob(val2, *holder.n2);
-                    if use_frontier_sharding {
-                        let shard = shard_for_label(val1, num_frontier_shards);
-                        match label_mode {
-                            LabelInsertMode::Sharded(stmts) => {
-                                stmts[shard].execute(params![*nall, label_blob, cplx_blob])?;
+                    let cplx_blob = encode_temp_bits(&frontier_rep, holder);
+                    if use_frontier_canonical_representative {
+                        if use_frontier_sharding {
+                            let shard = shard_for_label(val1, num_frontier_shards);
+                            match label_mode {
+                                LabelInsertMode::Sharded(stmts) => {
+                                    let affected =
+                                        stmts[shard].execute(params![*nall, cplx_blob])?;
+                                    if use_frontier_direct_dedup {
+                                        inserted_labeled += affected;
+                                    }
+                                }
+                                LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
                             }
-                            LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
-                        }
-                    } else if use_bulk_label_dedup {
-                        match label_mode {
-                            LabelInsertMode::Single(stmt1) => {
-                                stmt1.execute(params![*nall, label_blob, cplx_blob])?;
+                        } else if use_bulk_label_dedup {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![*nall, cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
                             }
-                            LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
+                        } else {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![cplx_blob, *nall])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("non-bulk label path uses single label mode"),
+                            }
                         }
                     } else {
-                        match label_mode {
-                            LabelInsertMode::Single(stmt1) => {
-                                stmt1.execute(params![label_blob, *nall, cplx_blob])?;
+                        let label_blob = encode_temp_bits(val1, holder);
+                        if use_frontier_sharding {
+                            let shard = shard_for_label(val1, num_frontier_shards);
+                            match label_mode {
+                                LabelInsertMode::Sharded(stmts) => {
+                                    let affected =
+                                        stmts[shard].execute(params![*nall, label_blob, cplx_blob])?;
+                                    if use_frontier_direct_dedup {
+                                        inserted_labeled += affected;
+                                    }
+                                }
+                                LabelInsertMode::Single(_) => unreachable!("frontier sharding requires sharded label mode"),
                             }
-                            LabelInsertMode::Sharded(_) => unreachable!("non-bulk label path uses single label mode"),
+                        } else if use_bulk_label_dedup {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![*nall, label_blob, cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("bulk label dedup without sharding uses single label mode"),
+                            }
+                        } else {
+                            match label_mode {
+                                LabelInsertMode::Single(stmt1) => {
+                                    stmt1.execute(params![label_blob, *nall, cplx_blob])?;
+                                }
+                                LabelInsertMode::Sharded(_) => unreachable!("non-bulk label path uses single label mode"),
+                            }
                         }
                     }
                 }
@@ -1520,10 +2201,10 @@ fn process_chunk(
                     if use_blob_encode_cache {
                         let good_blob = good_blob_cache
                             .entry(*val1)
-                            .or_insert_with(|| int_to_blob(val1));
+                            .or_insert_with(|| encode_main_bits(val1, holder));
                         good_shards[shard].execute(params![*ngood, &*good_blob])?;
                     } else {
-                        good_shards[shard].execute(params![*ngood, int_to_blob(val1)])?;
+                        good_shards[shard].execute(params![*ngood, encode_main_bits(val1, holder)])?;
                     }
                 } else if use_stage_good_inserts {
                     let good_stage = good_stage_opt
@@ -1532,15 +2213,15 @@ fn process_chunk(
                     if use_blob_encode_cache {
                         let good_blob = good_blob_cache
                             .entry(*val1)
-                            .or_insert_with(|| int_to_blob(val1));
+                            .or_insert_with(|| encode_main_bits(val1, holder));
                         good_stage.execute(params![&*good_blob, *ngood])?;
                     } else {
-                        good_stage.execute(params![int_to_blob(val1), *ngood])?;
+                        good_stage.execute(params![encode_main_bits(val1, holder), *ngood])?;
                     }
                 } else if use_blob_encode_cache {
                     let good_blob = good_blob_cache
                         .entry(*val1)
-                        .or_insert_with(|| int_to_blob(val1));
+                        .or_insert_with(|| encode_main_bits(val1, holder));
                     good_stmt_opt
                         .as_deref_mut()
                         .expect("Direct good insert mode requires stmt2.")
@@ -1549,7 +2230,7 @@ fn process_chunk(
                     good_stmt_opt
                         .as_deref_mut()
                         .expect("Direct good insert mode requires stmt2.")
-                        .execute(params![int_to_blob(val1), *ngood])?;
+                        .execute(params![encode_main_bits(val1, holder), *ngood])?;
                 }
             }
         }
@@ -1577,19 +2258,33 @@ fn test(_py: Python) -> PyResult<()> {
     Ok(())
 }
 
-fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: usize, initial_lengoodcplxs: usize, dbprefix: &String, db_name: &String) -> rusqlite::Result<()> {
+fn do_main_loop(imin: usize, imax: usize, ngood: usize, initial_lencplxs: usize, initial_lengoodcplxs: usize, dbprefix: &String, db_name: &String) -> rusqlite::Result<()> {
+    let n_value = *N.lock().unwrap();
+    match n_value {
+        0..=5 => do_main_loop_typed::<u128>(imin, imax, ngood, initial_lencplxs, initial_lengoodcplxs, dbprefix, db_name),
+        6 => do_main_loop_typed::<U256>(imin, imax, ngood, initial_lencplxs, initial_lengoodcplxs, dbprefix, db_name),
+        7 => do_main_loop_typed::<U768>(imin, imax, ngood, initial_lencplxs, initial_lengoodcplxs, dbprefix, db_name),
+        n => Err(RusqliteError::InvalidParameterName(format!(
+            "unsupported cube dimension {n}; compute backends are prepared only for n <= 7"
+        ))),
+    }
+}
+
+fn do_main_loop_typed<B: BitBackend>(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: usize, initial_lengoodcplxs: usize, dbprefix: &String, db_name: &String) -> rusqlite::Result<()> {
     // let vec = vec![16, 1, 3, 19, 51,0,0,0,0];
 
     // println!("{:?}",diffcompress(&vec));
     // println!("{:?}",diffdecompress(&diffcompress(&vec)));
     // println!("{:?}",diffcompress(&diffdecompress(&vec)));
 
-    ctrlc::set_handler(move || {
-        println!("\nReceived SIGINT, terminating.");
-        process::exit(0);
-    }).expect("Error setting Ctrl-C handler");
+    CTRLC_HANDLER_INSTALLED.get_or_init(|| {
+        ctrlc::set_handler(move || {
+            println!("\nReceived SIGINT, terminating.");
+            process::exit(0);
+        }).expect("Error setting Ctrl-C handler");
+    });
 
-    let holder = initialize_holder();
+    let holder = initialize_holder::<B>();
     let conn = Connection::open(db_name)?;
     tune_sqlite_main(&conn)?;
     let mut profile_log = if run_profile_log_enabled() {
@@ -1606,23 +2301,29 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
         let n_value = *N.lock().unwrap();
         let _ = writeln!(
             log,
-            "{} run_start run_label={} n={} chunksize={} run_mode={:?} temp_encoding_mode={:?} commit_every_chunks={} benchmark_max_level={:?} test_up_to={} run35_compat={} max_squares={} global_coverage_prune={} edge_neighborhood_prune={} edge_neighborhood_lookahead={} edge_neighborhood_lookahead_node_budget={} prioritized_edge_single_pass={} check_vertex_links={} reuse_vertex_codes={} fast_hash_dedup={} blob_encode_cache={} stage_good_inserts={} good_sharding={} good_shards={} good_final_merge={} bulk_label_dedup={} frontier_sharding={} frontier_shards={} frontier_sharding_min_level={} faceperm_by_cube={} batch_merge_inserts={} main_sync={} temp_sync={} main_wal_autocheckpoint={} temp_wal_autocheckpoint={} checkpoint_mode={} checkpoint_every_levels={}",
+            "{} run_start run_label={} n={} dbprefix={} chunksize={} backend_limbs={} backend_bits={} run_mode={:?} temp_encoding_mode={:?} commit_every_chunks={} benchmark_max_level={:?} test_up_to={} run35_compat={} max_squares={} global_coverage_prune={} edge_neighborhood_prune={} edge_neighborhood_lookahead={} edge_neighborhood_lookahead_node_budget={} prioritized_edge_single_pass={} canon_three_hop_refinement={} check_vertex_links={} reuse_vertex_codes={} fast_hash_dedup={} blob_encode_cache={} stage_good_inserts={} good_sharding={} good_shards={} good_final_merge={} bulk_label_dedup={} frontier_sharding={} frontier_shards={} frontier_sharding_min_level={} frontier_direct_dedup={} frontier_canonical_representative={} finalize_checkpoint_labels={} faceperm_cache={} batch_merge_inserts={} main_sync={} temp_sync={} main_wal_autocheckpoint={} temp_wal_autocheckpoint={} checkpoint_mode={} checkpoint_every_levels={}",
             Local::now().format("%Y-%m-%d %H:%M:%S"),
             run_label,
             n_value,
+            dbprefix,
             *holder.chunksize,
+            B::LIMBS,
+            B::BIT_WIDTH,
             RUN_MODE,
             TEMP_ENCODING_MODE,
             COMMIT_EVERY_CHUNKS,
             BENCHMARK_MAX_LEVEL,
             test_up_to_for_log(),
             run35_compat_enabled(),
-            functions::max_squares(),
+            functions::max_squares()
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "None".to_string()),
             functions::global_coverage_prune_enabled(),
             functions::edge_neighborhood_prune_enabled(),
             functions::edge_neighborhood_lookahead_depth(),
             functions::edge_neighborhood_lookahead_node_budget(),
             functions::prioritized_edge_single_pass_enabled(),
+            functions::canon_three_hop_refinement_enabled(),
             check_vertex_links_enabled(),
             reuse_vertex_codes_enabled(),
             fast_hash_dedup_enabled(),
@@ -1635,7 +2336,10 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
             frontier_sharding_enabled(),
             frontier_shards(),
             frontier_sharding_min_level(),
-            functions::faceperm_by_cube_enabled(),
+            frontier_direct_dedup_enabled(),
+            frontier_canonical_representative_enabled(),
+            finalize_checkpoint_labels_enabled(),
+            "on_demand",
             batch_merge_inserts_enabled(),
             main_sync_setting(),
             temp_sync_setting(),
@@ -1653,12 +2357,20 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
     }
     let mut lencplxs = initial_lencplxs;
     let mut lengoodcplxs = initial_lengoodcplxs;
+    let good_db_stem = db_stem(db_name);
     let use_good_sharding = good_sharding_enabled();
     let num_good_shards = if use_good_sharding { good_shards() } else { 1 };
     if use_good_sharding {
-        initialize_good_shards_from_main(&conn, num_good_shards)?;
+        initialize_good_shards_from_main(&conn, num_good_shards, &good_db_stem)?;
     }
-    let square_cap_stop = std::cmp::min(imax, functions::max_squares() as usize);
+    let use_closed_mode_for_square_cap = dbprefix.is_empty() || dbprefix == "d";
+    let square_cap_stop = if use_closed_mode_for_square_cap {
+        functions::max_squares()
+            .map(|x| std::cmp::min(imax, x as usize))
+            .unwrap_or(imax)
+    } else {
+        imax
+    };
     let benchmark_stop = BENCHMARK_MAX_LEVEL.map_or(square_cap_stop, |m| std::cmp::min(m, square_cap_stop));
     if benchmark_stop < imax {
         println!("Benchmark mode: stopping at level {} (requested imax={}).", benchmark_stop, imax);
@@ -1673,7 +2385,7 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
         benchmark_stop
     };
     let lookahead_depth = functions::edge_neighborhood_lookahead_depth();
-    if lookahead_depth >= 4 {
+    if dbprefix.is_empty() && lookahead_depth >= 4 {
         println!(
             "WARNING: EDGE_NEIGHBORHOOD_LOOKAHEAD={} may fail if EDGE_NEIGHBORHOOD_LOOKAHEAD_NODE_BUDGET={} is exceeded.",
             lookahead_depth,
@@ -1687,6 +2399,7 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
             println!("WARNING: current blob codec is not designed for >64-square support.");
         }
         let use_frontier_sharding = frontier_sharding_enabled() && i >= frontier_sharding_min_level();
+        let use_frontier_direct_dedup = use_frontier_sharding && frontier_direct_dedup_enabled();
         let source_paths = frontier_input_paths(i - 1);
         let mut goodtxconn_opt = if use_good_sharding {
             None
@@ -1711,15 +2424,35 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
             }
         }
         let mut nall = 0;
+        let mut frontier_direct_count = 0usize;
         let mut cc = 0;
         let ctot = ((lencplxs + *holder.chunksize - 1) / (*holder.chunksize)).max(1);
         let num_frontier_shards = if use_frontier_sharding { frontier_shards() } else { 1 };
+        let use_bulk_label_dedup = bulk_label_dedup_enabled() || (use_frontier_sharding && !use_frontier_direct_dedup);
+        let use_batch_merge_inserts = false;
+        let use_frontier_canonical_representative =
+            frontier_canonical_representative_enabled() && !use_batch_merge_inserts;
         let mut labelconn_opt = if use_frontier_sharding {
             None
         } else {
             let labelconn = Connection::open("templabels.db")?;
             tune_sqlite_temp(&labelconn)?;
-            if bulk_label_dedup_enabled() {
+            if use_frontier_canonical_representative {
+                labelconn.execute(
+                    if use_bulk_label_dedup {
+                        "CREATE TABLE IF NOT EXISTS labeledcplxs (
+                            id INTEGER PRIMARY KEY,
+                            cplx BLOB
+                        )"
+                    } else {
+                        "CREATE TABLE IF NOT EXISTS labeledcplxs (
+                            cplx BLOB PRIMARY KEY,
+                            id INTEGER
+                        )"
+                    },
+                    [],
+                )?;
+            } else if use_bulk_label_dedup {
                 labelconn.execute(
                     "CREATE TABLE IF NOT EXISTS labeledcplxs (
                         id INTEGER PRIMARY KEY,
@@ -1746,19 +2479,35 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                 let conn = Connection::open(templabel_shard_path(shard))?;
                 tune_sqlite_temp(&conn)?;
                 conn.execute(
-                    "CREATE TABLE IF NOT EXISTS labeledcplxs (
-                        id INTEGER PRIMARY KEY,
-                        label BLOB,
-                        cplx BLOB
-                    )",
+                    if use_frontier_canonical_representative && use_frontier_direct_dedup {
+                        "CREATE TABLE IF NOT EXISTS labeledcplxs (
+                            id INTEGER PRIMARY KEY,
+                            cplx BLOB UNIQUE
+                        )"
+                    } else if use_frontier_canonical_representative {
+                        "CREATE TABLE IF NOT EXISTS labeledcplxs (
+                            id INTEGER PRIMARY KEY,
+                            cplx BLOB
+                        )"
+                    } else if use_frontier_direct_dedup {
+                        "CREATE TABLE IF NOT EXISTS labeledcplxs (
+                            id INTEGER PRIMARY KEY,
+                            label BLOB UNIQUE,
+                            cplx BLOB
+                        )"
+                    } else {
+                        "CREATE TABLE IF NOT EXISTS labeledcplxs (
+                            id INTEGER PRIMARY KEY,
+                            label BLOB,
+                            cplx BLOB
+                        )"
+                    },
                     [],
                 )?;
                 label_shard_conns.push(conn);
             }
         }
-        let use_bulk_label_dedup = bulk_label_dedup_enabled() || use_frontier_sharding;
         // Keep batch-merge disabled while the sharded frontier pipeline stabilizes.
-        let use_batch_merge_inserts = false;
         let use_blob_encode_cache = blob_encode_cache_enabled();
         let use_stage_good_inserts = stage_good_inserts_enabled() && !use_batch_merge_inserts && !use_good_sharding;
         if use_stage_good_inserts {
@@ -1819,7 +2568,17 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                         .expect("sharded mode requires label transactions")
                         .iter_mut()
                     {
-                        stmts.push(tx.prepare("INSERT INTO labeledcplxs (id, label, cplx) VALUES (?, ?, ?)")?);
+                        stmts.push(tx.prepare(
+                            if use_frontier_canonical_representative && use_frontier_direct_dedup {
+                                "INSERT OR IGNORE INTO labeledcplxs (id, cplx) VALUES (?, ?)"
+                            } else if use_frontier_canonical_representative {
+                                "INSERT INTO labeledcplxs (id, cplx) VALUES (?, ?)"
+                            } else if use_frontier_direct_dedup {
+                                "INSERT OR IGNORE INTO labeledcplxs (id, label, cplx) VALUES (?, ?, ?)"
+                            } else {
+                                "INSERT INTO labeledcplxs (id, label, cplx) VALUES (?, ?, ?)"
+                            }
+                        )?);
                     }
                     LabelInsertMode::Sharded(stmts)
                 } else {
@@ -1827,9 +2586,23 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                         .as_mut()
                         .expect("non-sharded mode requires label transaction");
                     if use_batch_merge_inserts {
-                        stage_stmt1 = Some(tx.prepare("INSERT INTO chunk_labeled (label, id, cplx) VALUES (?, ?, ?)")?);
+                        stage_stmt1 = Some(tx.prepare(
+                            if use_frontier_canonical_representative {
+                                "INSERT INTO chunk_labeled (cplx, id) VALUES (?, ?)"
+                            } else {
+                                "INSERT INTO chunk_labeled (label, id, cplx) VALUES (?, ?, ?)"
+                            }
+                        )?);
                     }
-                    if use_bulk_label_dedup {
+                    if use_frontier_canonical_representative && use_bulk_label_dedup {
+                        LabelInsertMode::Single(
+                            tx.prepare("INSERT INTO labeledcplxs (id, cplx) VALUES (?, ?)")?
+                        )
+                    } else if use_frontier_canonical_representative {
+                        LabelInsertMode::Single(
+                            tx.prepare("INSERT OR IGNORE INTO labeledcplxs (cplx, id) VALUES (?, ?)")?
+                        )
+                    } else if use_bulk_label_dedup {
                         LabelInsertMode::Single(
                             tx.prepare("INSERT INTO labeledcplxs (id, label, cplx) VALUES (?, ?, ?)")?
                         )
@@ -1903,18 +2676,18 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                     let rows_iter = stmt.query_map(params![last_id, *holder.chunksize as i64], |row| {
                         let id: i64 = row.get(0)?;
                         let cplx_blob: Vec<u8> = row.get(1)?;
-                        Ok((id, decode_temp_blob(&cplx_blob, *holder.n2)))
+                        Ok((id, decode_temp_bits(&cplx_blob, &holder)))
                     })?;
 
-                    let chunk_rows: Result<Vec<(i64, U256)>, rusqlite::Error> = rows_iter.collect();
-                    let chunk_rows: Vec<(i64, U256)> = chunk_rows?;
+                    let chunk_rows: Result<Vec<(i64, B)>, rusqlite::Error> = rows_iter.collect();
+                    let chunk_rows: Vec<(i64, B)> = chunk_rows?;
                     let read_ms = read_start.elapsed().as_millis();
                     if chunk_rows.is_empty() {
                         no_more_rows = true;
                         break;
                     }
                     last_id = chunk_rows.last().expect("Chunk is not empty.").0;
-                    let chunk: Vec<U256> = chunk_rows.into_iter().map(|(_, c)| c).collect();
+                    let chunk: Vec<B> = chunk_rows.into_iter().map(|(_, c)| c).collect();
 
                     cc += 1;
                     print!("{: <85}\r", "");
@@ -1939,9 +2712,14 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                         use_good_sharding,
                         use_bulk_label_dedup,
                         use_frontier_sharding,
+                        use_frontier_direct_dedup,
+                        use_frontier_canonical_representative,
                         num_frontier_shards,
                         num_good_shards,
                     )?;
+                    if use_frontier_direct_dedup {
+                        frontier_direct_count += stats.inserted_labeled;
+                    }
                     let process_ms = process_start.elapsed().as_millis();
                     if let Some(log) = profile_log.as_mut() {
                         let _ = writeln!(
@@ -2029,7 +2807,7 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
             drop(cplxconn);
         }
         } else {
-            let mut cursors: Vec<SourceCursor> = Vec::new();
+            let mut cursors: Vec<SourceCursor<B>> = Vec::new();
             for source_path in &source_paths {
                 let conn = Connection::open(source_path)?;
                 tune_sqlite_temp(&conn)?;
@@ -2081,7 +2859,17 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                         .expect("sharded mode requires label transactions")
                         .iter_mut()
                     {
-                        stmts.push(tx.prepare("INSERT INTO labeledcplxs (id, label, cplx) VALUES (?, ?, ?)")?);
+                        stmts.push(tx.prepare(
+                            if use_frontier_canonical_representative && use_frontier_direct_dedup {
+                                "INSERT OR IGNORE INTO labeledcplxs (id, cplx) VALUES (?, ?)"
+                            } else if use_frontier_canonical_representative {
+                                "INSERT INTO labeledcplxs (id, cplx) VALUES (?, ?)"
+                            } else if use_frontier_direct_dedup {
+                                "INSERT OR IGNORE INTO labeledcplxs (id, label, cplx) VALUES (?, ?, ?)"
+                            } else {
+                                "INSERT INTO labeledcplxs (id, label, cplx) VALUES (?, ?, ?)"
+                            }
+                        )?);
                     }
                     LabelInsertMode::Sharded(stmts)
                 } else {
@@ -2089,9 +2877,23 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                         .as_mut()
                         .expect("non-sharded mode requires label transaction");
                     if use_batch_merge_inserts {
-                        stage_stmt1 = Some(tx.prepare("INSERT INTO chunk_labeled (label, id, cplx) VALUES (?, ?, ?)")?);
+                        stage_stmt1 = Some(tx.prepare(
+                            if use_frontier_canonical_representative {
+                                "INSERT INTO chunk_labeled (cplx, id) VALUES (?, ?)"
+                            } else {
+                                "INSERT INTO chunk_labeled (label, id, cplx) VALUES (?, ?, ?)"
+                            }
+                        )?);
                     }
-                    if use_bulk_label_dedup {
+                    if use_frontier_canonical_representative && use_bulk_label_dedup {
+                        LabelInsertMode::Single(
+                            tx.prepare("INSERT INTO labeledcplxs (id, cplx) VALUES (?, ?)")?
+                        )
+                    } else if use_frontier_canonical_representative {
+                        LabelInsertMode::Single(
+                            tx.prepare("INSERT OR IGNORE INTO labeledcplxs (cplx, id) VALUES (?, ?)")?
+                        )
+                    } else if use_bulk_label_dedup {
                         LabelInsertMode::Single(
                             tx.prepare("INSERT INTO labeledcplxs (id, label, cplx) VALUES (?, ?, ?)")?
                         )
@@ -2162,7 +2964,7 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
 
                 loop {
                     let read_start = Instant::now();
-                    let mut chunk: Vec<U256> = Vec::with_capacity(*holder.chunksize);
+                    let mut chunk: Vec<B> = Vec::with_capacity(*holder.chunksize);
                     while chunk.len() < *holder.chunksize {
                         let mut best_idx: Option<usize> = None;
                         let mut best_id: i64 = i64::MAX;
@@ -2172,12 +2974,12 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                                 continue;
                             }
                             if cursors[idx].pos >= cursors[idx].buf.len() {
-                                let rows = fetch_source_batch(
+                                let rows = fetch_source_batch::<B>(
                                     &cursors[idx].conn,
                                     i - 1,
                                     cursors[idx].last_id,
                                     *holder.chunksize,
-                                    *holder.n2,
+                                    &holder,
                                 )?;
                                 if rows.is_empty() {
                                     cursors[idx].exhausted = true;
@@ -2237,9 +3039,14 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                         use_good_sharding,
                         use_bulk_label_dedup,
                         use_frontier_sharding,
+                        use_frontier_direct_dedup,
+                        use_frontier_canonical_representative,
                         num_frontier_shards,
                         num_good_shards,
                     )?;
+                    if use_frontier_direct_dedup {
+                        frontier_direct_count += stats.inserted_labeled;
+                    }
                     let process_ms = process_start.elapsed().as_millis();
                     if let Some(log) = profile_log.as_mut() {
                         let _ = writeln!(
@@ -2332,16 +3139,25 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
         print!("{}: Dropping table ...         \r", Local::now().format("%Y-%m-%d %H:%M:%S"));
         io::stdout().flush().unwrap();
 
+        let finalize_total_start = Instant::now();
+        let source_drop_ms: u128;
+        let mut frontier_finalize = FinalizePhaseTimings::default();
+        let mut good_finalize = FinalizePhaseTimings::default();
+        let mut good_count_ms: u128 = 0;
+        let mut main_checkpoint_ms: u128 = 0;
+
         let source_temp_db_size: u64 = source_paths.iter().map(|p| file_size(p)).sum();
         let source_temp_wal_size: u64 = source_paths
             .iter()
             .map(|p| file_size(&format!("{p}-wal")))
             .sum();
 
+        let source_drop_start = Instant::now();
         for source_path in &source_paths {
             remove_sqlite_artifacts(source_path);
         }
         drop(good_stage_shard_conns);
+        source_drop_ms = source_drop_start.elapsed().as_millis();
         let staged_good_db_size_before_finalize: u64 = if use_good_sharding {
             (0..num_good_shards).map(|shard| file_size(&tempgood_shard_path(shard))).sum()
         } else {
@@ -2355,13 +3171,13 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
             0
         };
         let good_db_size_before_finalize: u64 = if use_good_sharding {
-            (0..num_good_shards).map(|shard| file_size(&goodcplx_shard_path(shard))).sum()
+            (0..num_good_shards).map(|shard| file_size(&goodcplx_shard_path(&good_db_stem, shard))).sum()
         } else {
             0
         };
         let good_wal_size_before_finalize: u64 = if use_good_sharding {
             (0..num_good_shards)
-                .map(|shard| file_size(&format!("{}-wal", goodcplx_shard_path(shard))))
+                .map(|shard| file_size(&format!("{}-wal", goodcplx_shard_path(&good_db_stem, shard))))
                 .sum()
         } else {
             0
@@ -2374,70 +3190,125 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
         let mut label_temp_db_size: u64 = 0;
         let mut label_temp_wal_size: u64 = 0;
         if materialize_next_frontier {
-            print!("{}: Copying table ...          \r", Local::now().format("%Y-%m-%d %H:%M:%S"));
+            if use_frontier_direct_dedup {
+                print!("{}: Finalizing frontier ...    \r", Local::now().format("%Y-%m-%d %H:%M:%S"));
+            } else {
+                print!("{}: Copying table ...          \r", Local::now().format("%Y-%m-%d %H:%M:%S"));
+            }
             io::stdout().flush().unwrap();
         }
         if use_frontier_sharding && materialize_next_frontier {
+            let frontier_total_start = Instant::now();
             drop(label_shard_conns);
             let mut shard_output_paths: Vec<String> = Vec::new();
             let mut shard_total_count: usize = 0;
             for shard in 0..num_frontier_shards {
-                let out_path = tempcplx_shard_path(i, shard);
-                let cplxconn = Connection::open(&out_path)?;
-                tune_sqlite_temp(&cplxconn)?;
-                cplxconn.execute(
-                    &format!(
-                        "CREATE TABLE cplxs{} (
-                                    id INTEGER PRIMARY KEY,
-                                    cplx BLOB
-                        )",
-                        i
-                    ),
-                    [],
-                )?;
                 let labelpath = templabel_shard_path(shard);
                 label_paths.push(labelpath.clone());
-                checkpoint_temp_db(&labelpath)?;
-                cplxconn.execute("ATTACH DATABASE ? AS templabels", params![labelpath])?;
-                cplxconn.execute(
-                    "CREATE TEMP TABLE dedup_ids AS
-                     SELECT MIN(id) AS id
-                     FROM templabels.labeledcplxs
-                     GROUP BY label",
-                    [],
-                )?;
-                cplxconn.execute(
-                    &format!(
-                        "INSERT INTO cplxs{} (id,cplx)
-                         SELECT l.id, l.cplx
-                         FROM templabels.labeledcplxs AS l
-                         JOIN dedup_ids AS d ON l.id = d.id
-                         ORDER BY l.id",
-                        i
-                    ),
-                    [],
-                )?;
-                cplxconn.execute("DROP TABLE dedup_ids", [])?;
-                cplxconn.execute("DETACH DATABASE templabels", [])?;
-                let shard_count: usize = cplxconn
-                    .query_row(&format!("SELECT COUNT(*) FROM cplxs{}", i), [], |row| row.get(0))
-                    .expect("Failed.");
-                drop(cplxconn);
-                if shard_count > 0 {
-                    shard_total_count += shard_count;
-                    shard_output_paths.push(out_path);
-                } else {
-                    remove_sqlite_artifacts(&out_path);
-                }
                 label_temp_db_size += file_size(&labelpath);
                 label_temp_wal_size += file_size(&format!("{labelpath}-wal"));
-                remove_sqlite_artifacts(&labelpath);
+                if use_frontier_direct_dedup {
+                    let out_path = tempcplx_shard_path(i, shard);
+                    let setup_start = Instant::now();
+                    let cplxconn = Connection::open(&labelpath)?;
+                    cplxconn.execute(
+                        &format!("ALTER TABLE labeledcplxs RENAME TO cplxs{}", i),
+                        [],
+                    )?;
+                    frontier_finalize.setup_ms += setup_start.elapsed().as_millis();
+                    let rename_start = Instant::now();
+                    drop(cplxconn);
+                    rename_sqlite_artifacts(&labelpath, &out_path)?;
+                    frontier_finalize.rename_ms += rename_start.elapsed().as_millis();
+                    shard_output_paths.push(out_path);
+                } else {
+                    let out_path = tempcplx_shard_path(i, shard);
+                    let setup_start = Instant::now();
+                    let cplxconn = Connection::open(&out_path)?;
+                    tune_sqlite_finalize_output(&cplxconn)?;
+                    cplxconn.execute(
+                        &format!(
+                            "CREATE TABLE cplxs{} (
+                                        id INTEGER PRIMARY KEY,
+                                        cplx BLOB
+                            )",
+                            i
+                        ),
+                        [],
+                    )?;
+                    frontier_finalize.setup_ms += setup_start.elapsed().as_millis();
+                    if finalize_checkpoint_labels_enabled() {
+                        let checkpoint_start = Instant::now();
+                        checkpoint_temp_db(&labelpath)?;
+                        frontier_finalize.checkpoint_ms += checkpoint_start.elapsed().as_millis();
+                    }
+                    let attach_start = Instant::now();
+                    cplxconn.execute("ATTACH DATABASE ? AS templabels", params![labelpath])?;
+                    frontier_finalize.attach_ms += attach_start.elapsed().as_millis();
+                    let insert_start = Instant::now();
+                    let shard_count = if use_frontier_canonical_representative {
+                        cplxconn.execute(
+                            &format!(
+                                "INSERT INTO cplxs{} (id,cplx)
+                                 SELECT MIN(id) AS id, cplx
+                                 FROM templabels.labeledcplxs
+                                 GROUP BY cplx
+                                 ORDER BY id",
+                                i
+                            ),
+                            [],
+                        )?
+                    } else {
+                        let dedup_start = Instant::now();
+                        cplxconn.execute(
+                            "CREATE TEMP TABLE dedup_ids AS
+                             SELECT MIN(id) AS id
+                             FROM templabels.labeledcplxs
+                             GROUP BY label",
+                            [],
+                        )?;
+                        frontier_finalize.dedup_ms += dedup_start.elapsed().as_millis();
+                        cplxconn.execute(
+                            &format!(
+                                "INSERT INTO cplxs{} (id,cplx)
+                                 SELECT l.id, l.cplx
+                                 FROM templabels.labeledcplxs AS l
+                                 JOIN dedup_ids AS d ON l.id = d.id
+                                 ORDER BY l.id",
+                                i
+                            ),
+                            [],
+                        )?
+                    };
+                    frontier_finalize.insert_ms += insert_start.elapsed().as_millis();
+                    let cleanup_start = Instant::now();
+                    if !use_frontier_canonical_representative {
+                        cplxconn.execute("DROP TABLE dedup_ids", [])?;
+                    }
+                    cplxconn.execute("DETACH DATABASE templabels", [])?;
+                    drop(cplxconn);
+                    if shard_count > 0 {
+                        shard_total_count += shard_count;
+                        shard_output_paths.push(out_path);
+                    } else {
+                        remove_sqlite_artifacts(&out_path);
+                    }
+                    remove_sqlite_artifacts(&labelpath);
+                    frontier_finalize.cleanup_ms += cleanup_start.elapsed().as_millis();
+                }
             }
-            next_count = shard_total_count;
+            frontier_finalize.total_ms = frontier_total_start.elapsed().as_millis();
+            next_count = if use_frontier_direct_dedup {
+                frontier_direct_count
+            } else {
+                shard_total_count
+            };
             next_paths = shard_output_paths;
         } else if !use_frontier_sharding && materialize_next_frontier {
+            let frontier_total_start = Instant::now();
+            let setup_start = Instant::now();
             let cplxconn = Connection::open(tempcplx_path(i))?;
-            tune_sqlite_temp(&cplxconn)?;
+            tune_sqlite_finalize_output(&cplxconn)?;
             cplxconn.execute(
                 &format!(
                     "CREATE TABLE cplxs{} (
@@ -2448,34 +3319,64 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                 ),
                 [],
             )?;
+            frontier_finalize.setup_ms += setup_start.elapsed().as_millis();
 
             let labelpath = "templabels.db";
             label_paths.push(labelpath.to_string());
-            checkpoint_temp_db(labelpath)?;
+            if finalize_checkpoint_labels_enabled() {
+                let checkpoint_start = Instant::now();
+                checkpoint_temp_db(labelpath)?;
+                frontier_finalize.checkpoint_ms += checkpoint_start.elapsed().as_millis();
+            }
+            let attach_start = Instant::now();
             cplxconn.execute("ATTACH DATABASE ? AS templabels", params![labelpath])?;
+            frontier_finalize.attach_ms += attach_start.elapsed().as_millis();
 
             if use_bulk_label_dedup {
-                cplxconn.execute(
-                    "CREATE TEMP TABLE dedup_ids AS
-                     SELECT MIN(id) AS id
-                     FROM templabels.labeledcplxs
-                     GROUP BY label",
-                    [],
-                )?;
-                cplxconn.execute(
-                    &format!(
-                        "INSERT INTO cplxs{} (id,cplx)
-                         SELECT l.id, l.cplx
-                         FROM templabels.labeledcplxs AS l
-                         JOIN dedup_ids AS d ON l.id = d.id
-                         ORDER BY l.id",
-                        i
-                    ),
-                    [],
-                )?;
-                cplxconn.execute("DROP TABLE dedup_ids", [])?;
+                let insert_start = Instant::now();
+                next_count = if use_frontier_canonical_representative {
+                    cplxconn.execute(
+                        &format!(
+                            "INSERT INTO cplxs{} (id,cplx)
+                             SELECT MIN(id) AS id, cplx
+                             FROM templabels.labeledcplxs
+                             GROUP BY cplx
+                             ORDER BY id",
+                            i
+                        ),
+                        [],
+                    )?
+                } else {
+                    let dedup_start = Instant::now();
+                    cplxconn.execute(
+                        "CREATE TEMP TABLE dedup_ids AS
+                         SELECT MIN(id) AS id
+                         FROM templabels.labeledcplxs
+                         GROUP BY label",
+                        [],
+                    )?;
+                    frontier_finalize.dedup_ms += dedup_start.elapsed().as_millis();
+                    cplxconn.execute(
+                        &format!(
+                            "INSERT INTO cplxs{} (id,cplx)
+                             SELECT l.id, l.cplx
+                             FROM templabels.labeledcplxs AS l
+                             JOIN dedup_ids AS d ON l.id = d.id
+                             ORDER BY l.id",
+                            i
+                        ),
+                        [],
+                    )?
+                };
+                frontier_finalize.insert_ms += insert_start.elapsed().as_millis();
+                let cleanup_start = Instant::now();
+                if !use_frontier_canonical_representative {
+                    cplxconn.execute("DROP TABLE dedup_ids", [])?;
+                }
+                frontier_finalize.cleanup_ms += cleanup_start.elapsed().as_millis();
             } else {
-                let _ = cplxconn.execute(
+                let insert_start = Instant::now();
+                next_count = cplxconn.execute(
                     &format!(
                         "INSERT INTO cplxs{} (id,cplx)
                          SELECT id, cplx
@@ -2483,13 +3384,12 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                         i
                     ),
                     [],
-                );
+                )?;
+                frontier_finalize.insert_ms += insert_start.elapsed().as_millis();
             }
 
+            let cleanup_start = Instant::now();
             cplxconn.execute("DETACH DATABASE templabels", [])?;
-            next_count = cplxconn
-                .query_row(&format!("SELECT COUNT(*) FROM cplxs{}", i), [], |row| row.get(0))
-                .expect("Failed.");
             next_paths.push(tempcplx_path(i));
             print!("{}: Dropping labeledcplxs ...\r", Local::now().format("%Y-%m-%d %H:%M:%S"));
             io::stdout().flush().unwrap();
@@ -2498,10 +3398,14 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
             drop(labelconn_opt.take());
             remove_sqlite_artifacts("templabels.db");
             drop(cplxconn);
+            frontier_finalize.cleanup_ms += cleanup_start.elapsed().as_millis();
+            frontier_finalize.total_ms = frontier_total_start.elapsed().as_millis();
         } else if use_frontier_sharding {
+            let frontier_total_start = Instant::now();
             drop(label_shard_conns);
             print!("{}: Dropping labeledcplxs ...\r", Local::now().format("%Y-%m-%d %H:%M:%S"));
             io::stdout().flush().unwrap();
+            let cleanup_start = Instant::now();
             for shard in 0..num_frontier_shards {
                 let labelpath = templabel_shard_path(shard);
                 label_paths.push(labelpath.clone());
@@ -2509,16 +3413,22 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
                 label_temp_wal_size += file_size(&format!("{labelpath}-wal"));
                 remove_sqlite_artifacts(&labelpath);
             }
+            frontier_finalize.cleanup_ms += cleanup_start.elapsed().as_millis();
+            frontier_finalize.total_ms = frontier_total_start.elapsed().as_millis();
             next_count = 0;
         } else {
+            let frontier_total_start = Instant::now();
             let labelpath = "templabels.db";
             label_paths.push(labelpath.to_string());
             print!("{}: Dropping labeledcplxs ...\r", Local::now().format("%Y-%m-%d %H:%M:%S"));
             io::stdout().flush().unwrap();
+            let cleanup_start = Instant::now();
             label_temp_db_size = file_size(labelpath);
             label_temp_wal_size = file_size(&format!("{labelpath}-wal"));
             drop(labelconn_opt.take());
             remove_sqlite_artifacts(labelpath);
+            frontier_finalize.cleanup_ms += cleanup_start.elapsed().as_millis();
+            frontier_finalize.total_ms = frontier_total_start.elapsed().as_millis();
             next_count = 0;
         }
 
@@ -2529,17 +3439,23 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
 
         lencplxs = if materialize_next_frontier { next_count } else { nall };
         if use_good_sharding {
-            let inserted_new_good = finalize_good_shards(num_good_shards)?;
+            let (inserted_new_good, timings) = finalize_good_shards(num_good_shards, &good_db_stem)?;
+            good_finalize = timings;
             lengoodcplxs += inserted_new_good;
         } else {
+            let good_count_start = Instant::now();
             lengoodcplxs = conn.query_row("SELECT COUNT(*) FROM goodcplxs", [], |row| row.get(0),).expect("Failed.");
+            good_count_ms = good_count_start.elapsed().as_millis();
         }
         if let Some(mode) = checkpoint_mode() {
             let level_idx = i.saturating_sub(imin) + 1;
             if level_idx % checkpoint_every_levels() == 0 {
+                let checkpoint_start = Instant::now();
                 let _ = conn.execute(&format!("PRAGMA wal_checkpoint({mode})"), []);
+                main_checkpoint_ms = checkpoint_start.elapsed().as_millis();
             }
         }
+        let finalize_total_ms = finalize_total_start.elapsed().as_millis();
         if let Some(log) = profile_log.as_mut() {
             let main_wal = format!("{}-wal", db_name);
             let next_temp_db_size: u64 = next_paths.iter().map(|p| file_size(p)).sum();
@@ -2550,13 +3466,13 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
             let main_db_size = file_size(db_name);
             let main_wal_size = file_size(&main_wal);
             let good_db_size_after_finalize: u64 = if use_good_sharding {
-                (0..num_good_shards).map(|shard| file_size(&goodcplx_shard_path(shard))).sum()
+                (0..num_good_shards).map(|shard| file_size(&goodcplx_shard_path(&good_db_stem, shard))).sum()
             } else {
                 0
             };
             let good_wal_size_after_finalize: u64 = if use_good_sharding {
                 (0..num_good_shards)
-                    .map(|shard| file_size(&format!("{}-wal", goodcplx_shard_path(shard))))
+                    .map(|shard| file_size(&format!("{}-wal", goodcplx_shard_path(&good_db_stem, shard))))
                     .sum()
             } else {
                 0
@@ -2580,6 +3496,32 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
             let estimated_live_total_peak = std::cmp::max(
                 estimated_live_total_before_finalize,
                 estimated_live_total_after_finalize,
+            );
+            let _ = writeln!(
+                log,
+                "{} level={} finalize_total_ms={} source_drop_ms={} frontier_total_ms={} frontier_setup_ms={} frontier_checkpoint_ms={} frontier_attach_ms={} frontier_dedup_ms={} frontier_insert_ms={} frontier_rename_ms={} frontier_cleanup_ms={} good_total_ms={} good_setup_ms={} good_checkpoint_ms={} good_attach_ms={} good_dedup_ms={} good_insert_ms={} good_rename_ms={} good_cleanup_ms={} good_count_ms={} post_checkpoint_ms={}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                i,
+                finalize_total_ms,
+                source_drop_ms,
+                frontier_finalize.total_ms,
+                frontier_finalize.setup_ms,
+                frontier_finalize.checkpoint_ms,
+                frontier_finalize.attach_ms,
+                frontier_finalize.dedup_ms,
+                frontier_finalize.insert_ms,
+                frontier_finalize.rename_ms,
+                frontier_finalize.cleanup_ms,
+                good_finalize.total_ms,
+                good_finalize.setup_ms,
+                good_finalize.checkpoint_ms,
+                good_finalize.attach_ms,
+                good_finalize.dedup_ms,
+                good_finalize.insert_ms,
+                good_finalize.rename_ms,
+                good_finalize.cleanup_ms,
+                good_count_ms,
+                main_checkpoint_ms,
             );
             let _ = writeln!(
                 log,
@@ -2650,15 +3592,14 @@ fn do_main_loop(imin: usize, imax: usize, mut ngood: usize, initial_lencplxs: us
     if use_good_sharding && good_final_merge_enabled() {
         print!("Merging good shards ...\r");
         io::stdout().flush().unwrap();
-        merge_good_shards_into_main(&conn, num_good_shards)?;
+        merge_good_shards_into_main(&conn, num_good_shards, &good_db_stem)?;
         for shard in 0..num_good_shards {
-            remove_sqlite_artifacts(&goodcplx_shard_path(shard));
+            remove_sqlite_artifacts(&goodcplx_shard_path(&good_db_stem, shard));
         }
     } else if use_good_sharding {
-        let n_value = *N.lock().unwrap();
         println!(
-            "Final good output left sharded as cplxs{}_good_part_XX.db ({} shards).",
-            n_value,
+            "Final good output left sharded as {}_good_part_XX.db ({} shards).",
+            good_db_stem,
             num_good_shards
         );
     }

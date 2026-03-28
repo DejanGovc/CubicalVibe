@@ -28,14 +28,21 @@ def remove_sqlite_glob(pattern):
             continue
         remove_sqlite_artifacts(path)
 
-def final_good_shard_pattern(n):
+def final_good_shard_pattern(dbprefix, n):
+    return f"{dbprefix}cplxs{n}_good_part_*.db"
+
+def legacy_final_good_shard_pattern(n):
     return f"cplxs{n}_good_part_*.db"
 
 def legacy_good_shard_pattern():
     return "goodcplxs_s*.db"
 
-def has_existing_final_good_shards(n):
-    return bool(glob.glob(final_good_shard_pattern(n))) or bool(glob.glob(legacy_good_shard_pattern()))
+def has_existing_final_good_shards(dbprefix, n):
+    return (
+        bool(glob.glob(final_good_shard_pattern(dbprefix, n)))
+        or bool(glob.glob(legacy_final_good_shard_pattern(n)))
+        or bool(glob.glob(legacy_good_shard_pattern()))
+    )
 
 def env_truthy(name, default=False):
     v = os.environ.get(name)
@@ -58,7 +65,7 @@ def main():
     lencplxs = len(cplxs)
     db_name = dbprefix+f'cplxs{n}.db'
     existing_main_output = os.path.exists(db_name)
-    existing_good_shards = has_existing_final_good_shards(n)
+    existing_good_shards = has_existing_final_good_shards(dbprefix, n)
     if existing_main_output or existing_good_shards:
         if env_truthy("AUTO_OVERWRITE_DB", default=False):
             response = "o"
@@ -71,7 +78,8 @@ def main():
         if response == 'o':
             print("Overwriting previous output.")
             remove_sqlite_artifacts(db_name)
-            remove_sqlite_glob(final_good_shard_pattern(n))
+            remove_sqlite_glob(final_good_shard_pattern(dbprefix, n))
+            remove_sqlite_glob(legacy_final_good_shard_pattern(n))
             remove_sqlite_glob(legacy_good_shard_pattern())
         else:
             print("Cannot proceed without permission. Exiting computation.")
@@ -96,8 +104,8 @@ def main():
             )
         """)
         if dbprefix == "b" or dbprefix == "db":
-            cursor.execute("INSERT INTO goodcplxs (cplx) VALUES (?)", 
-                        (fn.int_to_blob(cplxs[0]),))
+            cursor.execute("INSERT INTO goodcplxs (cplx, id) VALUES (?, ?)", 
+                        (fn.int_to_blob(cplxs[0]), 1))
         conn.commit()
         cplxcursor.execute("""
             CREATE TABLE IF NOT EXISTS cplxs1 (
