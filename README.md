@@ -9,6 +9,8 @@ To compile and run the software, use:
 python3 cubical.py
 ```
 
+**Remark:** Under Windows, the easiest way to compile is probably with WSL/Ubuntu.
+
 The following is an AI-generated summary of the project.
 
 ---
